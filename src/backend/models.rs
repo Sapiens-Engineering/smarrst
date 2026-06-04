@@ -96,6 +96,10 @@ pub struct Settings {
     pub time_half_life_hours: f32,
     pub category_labels: Vec<String>,
     pub category_weight: f32,
+    /// Interval for the background refresh loop, in minutes. `0` disables
+    /// the loop. The setting is re-read on every tick, so changes from
+    /// the Settings dialog take effect on the next tick (no restart).
+    pub background_refresh_minutes: u32,
 }
 
 impl Default for Settings {
@@ -108,6 +112,7 @@ impl Default for Settings {
             time_half_life_hours: 168.0,
             category_labels: DEFAULT_CATEGORIES.iter().map(|s| s.to_string()).collect(),
             category_weight: 1.0,
+            background_refresh_minutes: 15,
         }
     }
 }

@@ -4,9 +4,11 @@ pub mod db;
 pub mod models;
 pub mod ollama;
 pub mod ranking;
+pub mod refresh;
 pub mod rss;
 pub mod settings;
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -15,6 +17,11 @@ pub struct AppState {
     pub db: Arc<Mutex<rusqlite::Connection>>,
     pub http: reqwest::Client,
     pub settings: Arc<Mutex<models::Settings>>,
+    /// Set while a refresh pipeline (manual or background) is in flight.
+    /// The background loop and the manual button both swap-test-set on
+    /// this; whichever loses the race skips its run instead of stacking
+    /// a second pipeline on top of the first.
+    pub refresh_running: Arc<AtomicBool>,
 }
 
 pub const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -48,6 +55,7 @@ impl AppState {
                 // would break the many sites that still speak only h1.1.)
                 .build()?,
             settings: Arc::new(Mutex::new(settings)),
+            refresh_running: Arc::new(AtomicBool::new(false)),
         })
     }
 }

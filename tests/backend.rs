@@ -1,7 +1,7 @@
 //! Integration tests for the smarrst backend. Exercise database, settings and
 //! ranking logic against an in-memory SQLite store; do not require Ollama.
 
-use smarrst::backend::{content, db, models, ollama, ranking, settings};
+use smarrst::backend::{content, db, models, ollama, ranking, refresh, settings};
 
 fn open_memory() -> rusqlite::Connection {
     rusqlite::Connection::open_in_memory().expect("open in-memory db")
@@ -289,12 +289,80 @@ fn settings_persist() {
         time_half_life_hours: 24.0,
         category_labels: vec!["Tech".into(), "Politics".into()],
         category_weight: 1.0,
+        background_refresh_minutes: 7,
     };
     settings::save(&conn, &s).unwrap();
     let loaded = settings::load(&conn).unwrap();
     assert_eq!(loaded.ollama_url, "http://example:1234");
     assert_eq!(loaded.ollama_embed_model, "embed-x");
     assert!((loaded.time_half_life_hours - 24.0).abs() < 1e-6);
+    assert_eq!(loaded.background_refresh_minutes, 7);
+}
+
+#[test]
+fn settings_round_trip_preserves_background_refresh_minutes() {
+    let conn = open_memory();
+    db::init_schema(&conn).expect("init");
+    // Saving 0 (disabled) round-trips as 0.
+    settings::save(
+        &conn,
+        &models::Settings {
+            background_refresh_minutes: 0,
+            ..models::Settings::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(settings::load(&conn).unwrap().background_refresh_minutes, 0);
+
+    // A non-default value also round-trips.
+    settings::save(
+        &conn,
+        &models::Settings {
+            background_refresh_minutes: 30,
+            ..models::Settings::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        settings::load(&conn).unwrap().background_refresh_minutes,
+        30
+    );
+
+    // A garbage value falls back to the default (15) instead of panicking.
+    conn.execute(
+        "UPDATE settings SET value = 'not-a-number' WHERE key = 'background_refresh_minutes'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        settings::load(&conn).unwrap().background_refresh_minutes,
+        15
+    );
+}
+
+#[test]
+fn is_disabled_uses_zero_as_sentinel() {
+    // The convention: 0 minutes = disabled. This is the contract the
+    // Settings dialog and the run_background_loop both rely on, so
+    // pin it down here.
+    assert!(refresh::is_disabled(0));
+    assert!(!refresh::is_disabled(1));
+    assert!(!refresh::is_disabled(15));
+    assert!(!refresh::is_disabled(u32::MAX));
+}
+
+#[test]
+fn refresh_lock_allows_only_one_holder() {
+    use std::sync::atomic::AtomicBool;
+    let flag = AtomicBool::new(false);
+    // First acquire wins.
+    assert!(refresh::try_acquire_refresh_lock(&flag));
+    // Second acquire while the first is held must fail.
+    assert!(!refresh::try_acquire_refresh_lock(&flag));
+    // After release, a new acquire succeeds.
+    refresh::release_refresh_lock(&flag);
+    assert!(refresh::try_acquire_refresh_lock(&flag));
+    refresh::release_refresh_lock(&flag);
 }
 
 #[test]

@@ -1,5 +1,5 @@
 [application]
 # Window title shown in the title bar
-name = "smarrst"
+name = "smaRRSt"
 # CSS file to inject into the webview
 asset_root = "assets"

@@ -445,6 +445,12 @@ pub fn articles_pending_classification(
     conn: &rusqlite::Connection,
     limit: i64,
 ) -> anyhow::Result<Vec<Article>> {
+    // Includes articles whose content fetch failed: classification only
+    // needs a title (and optionally a summary) to pick a label, so
+    // gating on `content_status != 'failed'` would leave those articles
+    // stuck with `category = NULL` forever. The Rust-side filter in
+    // `classify_pending_with_concurrency` already drops inputs whose
+    // combined title+summary+content is empty.
     let mut stmt = conn.prepare(
         "SELECT a.id, a.feed_id, f.title, a.title, a.url, a.author, a.summary, a.content,
                 a.published, a.fetched_at,
@@ -459,7 +465,6 @@ pub fn articles_pending_classification(
          JOIN feeds f ON f.id = a.feed_id
          LEFT JOIN votes v ON v.article_id = a.id
          WHERE a.category IS NULL
-           AND a.content_status != 'failed'
            AND (a.content IS NOT NULL OR a.summary IS NOT NULL OR a.title != '')
          ORDER BY a.id DESC
          LIMIT ?1",

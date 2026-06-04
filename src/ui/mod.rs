@@ -1,4 +1,5 @@
 use crate::backend::models::Article;
+use crate::backend::refresh::BackgroundStatus;
 use crate::ui::context::{use_app_state, AppContext};
 use dioxus::desktop::{use_window, LogicalSize};
 use dioxus::prelude::*;
@@ -27,6 +28,15 @@ pub fn App() -> Element {
     let mut status_message = use_signal(|| "Loading...".to_string());
     let mut refreshing = use_signal(|| false);
     let category_counts = use_signal(Vec::<(String, i64, i64)>::new);
+    let background_status = use_signal(BackgroundStatus::default);
+    // Bumped after every successful list refresh; the article-list
+    // section uses it as a `key` so the whole subtree re-mounts and
+    // the for-loop is guaranteed to pick up new items. Without this,
+    // writes to `articles` from inside a spawn block can leave the
+    // keyed for-loop diff seeing the same set of keys and skipping
+    // the visible re-render (topbar/status updates because they have
+    // no keyed children).
+    let list_version = use_signal(|| 0u64);
 
     let _app: AppContext = use_context();
     use_effect(move || {
@@ -39,6 +49,7 @@ pub fn App() -> Element {
                 selected_category(),
                 articles,
                 status_message,
+                list_version,
             )
             .await;
             refresh_category_counts(state.clone(), category_counts, status_message).await;
@@ -65,6 +76,7 @@ pub fn App() -> Element {
                 cat.clone(),
                 articles,
                 status_message,
+                list_version,
             )
             .await;
             refresh_category_counts(state.clone(), category_counts, status_message).await;
@@ -79,7 +91,7 @@ pub fn App() -> Element {
             if let Err(e) = backend::ranking::embed_pending(&state, 256).await {
                 log::warn!("startup embedding failed: {e}");
             }
-            refresh_articles(state, selected_feed(), cat, articles, status_message).await;
+            refresh_articles(state, selected_feed(), cat, articles, status_message, list_version).await;
         });
     });
 
@@ -98,15 +110,40 @@ pub fn App() -> Element {
         }
     });
 
+    // Background refresh loop. Runs forever; cancelled automatically
+    // when the Dioxus runtime drops (app close). The loop re-reads the
+    // interval from settings on every tick, so the Settings dialog can
+    // disable it or change the cadence without restarting the app.
+    use_effect(move || {
+        let state = use_app_state();
+        let status = background_status;
+        let list = articles;
+        let counts = category_counts;
+        spawn(async move {
+            backend::refresh::run_background_loop(state, status, list, counts).await;
+        });
+    });
+
     rsx! {
         style { {include_str!("../../assets/styles.css")} }
         div { class: "app",
             header { class: "topbar",
-                h1 { "smarrst" }
+                h1 { "smaRRSt" }
+                {
+                    let bs = background_status();
+                    let pill_class = match &bs {
+                        BackgroundStatus::Refreshing => "bg-status refreshing",
+                        BackgroundStatus::Error { .. } => "bg-status error",
+                        _ => "bg-status",
+                    };
+                    rsx! {
+                        div { class: "{pill_class}", title: bs.label(), "{bs.label()}" }
+                    }
+                }
                 div { class: "topbar-actions",
                     button {
                         class: "btn btn-primary",
-                        disabled: refreshing(),
+                        disabled: refreshing() || matches!(background_status(), BackgroundStatus::Refreshing),
                         onclick: move |_| {
                             let state = use_app_state();
                             spawn(async move {
@@ -116,7 +153,7 @@ pub fn App() -> Element {
                                     Ok(n) => {
                                         *status_message.write() = format!("Refreshed {n} new articles");
                                         let cat = selected_category();
-                                        refresh_articles(state.clone(), selected_feed(), cat, articles, status_message).await;
+                                        refresh_articles(state.clone(), selected_feed(), cat, articles, status_message, list_version).await;
                                         refresh_category_counts(state.clone(), category_counts, status_message).await;
                                     }
                                     Err(e) => {
@@ -152,7 +189,7 @@ pub fn App() -> Element {
                                 let state = use_app_state();
                                 let cat = selected_category();
                                 spawn(async move {
-                                    refresh_articles(state.clone(), None, cat, articles, status_message).await;
+                                    refresh_articles(state.clone(), None, cat, articles, status_message, list_version).await;
                                 });
                             },
                             "All articles"
@@ -166,7 +203,7 @@ pub fn App() -> Element {
                                     let state = use_app_state();
                                     let cat = selected_category();
                                     spawn(async move {
-                                        refresh_articles(state.clone(), Some(id), cat, articles, status_message).await;
+                                        refresh_articles(state.clone(), Some(id), cat, articles, status_message, list_version).await;
                                     });
                                 },
                                 on_delete: move |id: i64| {
@@ -180,7 +217,7 @@ pub fn App() -> Element {
                                         if selected_feed() == Some(id) {
                                             *selected_feed.write() = None;
                                         }
-                                        refresh_articles(state.clone(), selected_feed(), cat, articles, status_message).await;
+                                        refresh_articles(state.clone(), selected_feed(), cat, articles, status_message, list_version).await;
                                     });
                                 },
                             }
@@ -198,7 +235,7 @@ pub fn App() -> Element {
                                     let state = use_app_state();
                                     let fid = selected_feed();
                                     spawn(async move {
-                                        refresh_articles(state.clone(), fid, None, articles, status_message).await;
+                                        refresh_articles(state.clone(), fid, None, articles, status_message, list_version).await;
                                     });
                                 },
                                 "All"
@@ -215,7 +252,7 @@ pub fn App() -> Element {
                                         let state = use_app_state();
                                         let fid = selected_feed();
                                         spawn(async move {
-                                            refresh_articles(state.clone(), fid, Some(n), articles, status_message).await;
+                                            refresh_articles(state.clone(), fid, Some(n), articles, status_message, list_version).await;
                                         });
                                     },
                                 }
@@ -223,7 +260,7 @@ pub fn App() -> Element {
                         }
                     }
                 }
-                section { class: "article-list",
+                section { class: "article-list", key: "{list_version()}",
                     h2 {
                         {
                             let id = selected_feed();
@@ -260,7 +297,7 @@ pub fn App() -> Element {
                                 let state = use_app_state();
                                 let cat = selected_category();
                                 spawn(async move {
-                                    refresh_articles(state.clone(), selected_feed(), cat, articles, status_message).await;
+                                    refresh_articles(state.clone(), selected_feed(), cat, articles, status_message, list_version).await;
                                     refresh_category_counts(state.clone(), category_counts, status_message).await;
                                 });
                             },
@@ -280,7 +317,7 @@ pub fn App() -> Element {
                     let cat = selected_category();
                     spawn(async move {
                         refresh_feeds_list(state.clone(), feeds, status_message).await;
-                        refresh_articles(state.clone(), selected_feed(), cat, articles, status_message).await;
+                        refresh_articles(state.clone(), selected_feed(), cat, articles, status_message, list_version).await;
                     });
                 },
             }
@@ -315,6 +352,7 @@ async fn refresh_articles(
     category_filter: Option<String>,
     mut articles: Signal<Vec<Article>>,
     mut status: Signal<String>,
+    mut list_version: Signal<u64>,
 ) {
     let half_life = {
         let s = state.settings.lock().await;
@@ -331,6 +369,10 @@ async fn refresh_articles(
             };
             *status.write() = format!("{} article(s) shown", filtered.len());
             *articles.write() = filtered;
+            // Force the article-list section to re-mount so the keyed
+            // for-loop inside it picks up the new Vec even when the
+            // set of keys is unchanged.
+            *list_version.write() += 1;
         }
         Err(e) => {
             *status.write() = format!("Ranking failed: {e}");
@@ -809,6 +851,7 @@ fn SettingsDialog(on_close: EventHandler<()>) -> Element {
     let mut embed_model = use_signal(String::new);
     let mut chat_model = use_signal(String::new);
     let mut half_life = use_signal(String::new);
+    let mut background_minutes = use_signal(String::new);
     let mut error = use_signal(String::new);
     let mut ping_status = use_signal(String::new);
     let mut busy = use_signal(|| false);
@@ -821,6 +864,7 @@ fn SettingsDialog(on_close: EventHandler<()>) -> Element {
             embed_model.set(s.ollama_embed_model);
             chat_model.set(s.ollama_chat_model);
             half_life.set(s.time_half_life_hours.to_string());
+            background_minutes.set(s.background_refresh_minutes.to_string());
         });
     });
 
@@ -849,6 +893,15 @@ fn SettingsDialog(on_close: EventHandler<()>) -> Element {
                     step: "0.5",
                     value: "{half_life}",
                     oninput: move |e| half_life.set(e.value()),
+                }
+                label { "Background refresh interval (minutes)" }
+                input {
+                    r#type: "number",
+                    min: "0",
+                    step: "1",
+                    value: "{background_minutes}",
+                    title: "How often the background loop checks every feed for new articles. 0 disables the loop. Changes take effect on the next tick (no app restart).",
+                    oninput: move |e| background_minutes.set(e.value()),
                 }
                 if !error().is_empty() {
                     div { class: "error", "{error()}" }
@@ -892,6 +945,7 @@ fn SettingsDialog(on_close: EventHandler<()>) -> Element {
                                         .map(|s| s.to_string())
                                         .collect(),
                                     category_weight: 1.0,
+                                    background_refresh_minutes: background_minutes().parse().unwrap_or(15),
                                 };
                                 match backend::actions::save_settings(&state, &new_settings).await {
                                     Ok(()) => {

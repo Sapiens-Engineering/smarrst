@@ -7,6 +7,11 @@ pub fn load(conn: &Connection) -> anyhow::Result<Settings> {
             .parse()
             .unwrap_or_else(|_| default.parse().unwrap_or(0.0)))
     };
+    let parse_u32 = |key: &str, default: &str| -> anyhow::Result<u32> {
+        Ok(read_string(conn, key, default)?
+            .parse()
+            .unwrap_or_else(|_| default.parse().unwrap_or(0)))
+    };
     let default_labels_json = serde_json::to_string(
         &DEFAULT_CATEGORIES
             .iter()
@@ -24,6 +29,7 @@ pub fn load(conn: &Connection) -> anyhow::Result<Settings> {
         time_half_life_hours: parse_f32("time_half_life_hours", "168.0")?,
         category_labels,
         category_weight: parse_f32("category_weight", "1.0")?,
+        background_refresh_minutes: parse_u32("background_refresh_minutes", "15")?,
     })
 }
 
@@ -43,6 +49,11 @@ pub fn save(conn: &Connection, s: &Settings) -> anyhow::Result<()> {
         &serde_json::to_string(&s.category_labels)?,
     )?;
     write_string(conn, "category_weight", &s.category_weight.to_string())?;
+    write_string(
+        conn,
+        "background_refresh_minutes",
+        &s.background_refresh_minutes.to_string(),
+    )?;
     Ok(())
 }
 

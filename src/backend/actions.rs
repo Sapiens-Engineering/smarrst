@@ -69,18 +69,11 @@ pub async fn add_feed(state: &AppState, url: &str) -> anyhow::Result<()> {
 }
 
 pub async fn refresh_all(state: &AppState) -> anyhow::Result<usize> {
-    let feeds = list_feeds(state).await?;
-    let mut total = 0;
-    for f in feeds {
-        match rss::refresh_feed(state, f.id).await {
-            Ok(n) => total += n,
-            Err(e) => log::warn!("refresh feed {} failed: {e}", f.id),
-        }
-    }
+    let summary = crate::backend::refresh::concurrent_refresh_all(state, 4).await?;
     let _ = fetch_pending_content(state, 256).await;
     let _ = ranking::embed_pending(state, 256).await;
     let _ = classify_pending(state, 256).await;
-    Ok(total)
+    Ok(summary.new_articles)
 }
 
 pub async fn delete_feed(state: &AppState, id: i64) -> anyhow::Result<()> {
