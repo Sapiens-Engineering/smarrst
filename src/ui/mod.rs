@@ -8,30 +8,81 @@ use crate::backend;
 pub mod context;
 pub mod markdown;
 
+fn category_slug(c: &str) -> String {
+    c.to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect()
+}
+
 #[component]
 pub fn App() -> Element {
     let feeds = use_signal(Vec::<crate::backend::models::Feed>::new);
     let articles = use_signal(Vec::<Article>::new);
     let mut selected_feed = use_signal(|| None::<i64>);
     let mut selected_article = use_signal(|| None::<i64>);
+    let mut selected_category = use_signal(|| None::<String>);
     let mut show_add_feed = use_signal(|| false);
     let mut show_settings = use_signal(|| false);
     let mut status_message = use_signal(|| "Loading...".to_string());
     let mut refreshing = use_signal(|| false);
+    let category_counts = use_signal(Vec::<(String, i64, i64)>::new);
 
-    // Initial load
     let _app: AppContext = use_context();
     use_effect(move || {
         let state = use_app_state();
         spawn(async move {
             refresh_feeds_list(state.clone(), feeds, status_message).await;
-            refresh_articles(state.clone(), selected_feed(), articles, status_message).await;
+            refresh_articles(
+                state.clone(),
+                selected_feed(),
+                selected_category(),
+                articles,
+                status_message,
+            )
+            .await;
+            refresh_category_counts(state.clone(), category_counts, status_message).await;
+
+            // The fetch/embed/classify pipeline is normally kicked off by
+            // add_feed / refresh_all, but on a fresh launch any articles
+            // already in the database (e.g. from before the category
+            // feature shipped) would sit with `category = NULL` forever.
+            //
+            // Classify runs FIRST because it only needs title + summary
+            // (no content fetch, no embed). Running it before the
+            // network-heavy fetch step means the Categories sidebar
+            // becomes visible within seconds rather than after several
+            // minutes of article fetching.
+            *status_message.write() = "Classifying existing articles…".to_string();
+            if let Err(e) = backend::actions::classify_pending(&state, 256).await {
+                log::warn!("startup classify failed: {e}");
+            }
+            // Show categories in the UI as soon as classify finishes.
+            let cat = selected_category();
+            refresh_articles(
+                state.clone(),
+                selected_feed(),
+                cat.clone(),
+                articles,
+                status_message,
+            )
+            .await;
+            refresh_category_counts(state.clone(), category_counts, status_message).await;
+            *status_message.write() = "Categories ready.".to_string();
+
+            // Fetch + embed can finish in the background. They update
+            // embeddings (and content for thin RSS bodies) but don't
+            // affect the category sidebar.
+            if let Err(e) = backend::actions::fetch_pending_content(&state, 256).await {
+                log::warn!("startup content fetch failed: {e}");
+            }
+            if let Err(e) = backend::ranking::embed_pending(&state, 256).await {
+                log::warn!("startup embedding failed: {e}");
+            }
+            refresh_articles(state, selected_feed(), cat, articles, status_message).await;
         });
     });
 
-    // Resize the window to 2/3 of the primary monitor's width and ~85% of its
-    // height on first mount. We can't do this in main() because Dioxus owns
-    // the event loop there.
     use_effect(move || {
         let window = use_window();
         if let Some(monitor) = window.window.primary_monitor() {
@@ -64,7 +115,9 @@ pub fn App() -> Element {
                                 match backend::actions::refresh_all(&state).await {
                                     Ok(n) => {
                                         *status_message.write() = format!("Refreshed {n} new articles");
-                                        refresh_articles(state.clone(), selected_feed(), articles, status_message).await;
+                                        let cat = selected_category();
+                                        refresh_articles(state.clone(), selected_feed(), cat, articles, status_message).await;
+                                        refresh_category_counts(state.clone(), category_counts, status_message).await;
                                     }
                                     Err(e) => {
                                         *status_message.write() = format!("Refresh failed: {e}");
@@ -97,8 +150,9 @@ pub fn App() -> Element {
                             onclick: move |_| {
                                 *selected_feed.write() = None;
                                 let state = use_app_state();
+                                let cat = selected_category();
                                 spawn(async move {
-                                    refresh_articles(state.clone(), None, articles, status_message).await;
+                                    refresh_articles(state.clone(), None, cat, articles, status_message).await;
                                 });
                             },
                             "All articles"
@@ -110,12 +164,14 @@ pub fn App() -> Element {
                                 on_select: move |id: i64| {
                                     *selected_feed.write() = Some(id);
                                     let state = use_app_state();
+                                    let cat = selected_category();
                                     spawn(async move {
-                                        refresh_articles(state.clone(), Some(id), articles, status_message).await;
+                                        refresh_articles(state.clone(), Some(id), cat, articles, status_message).await;
                                     });
                                 },
                                 on_delete: move |id: i64| {
                                     let state = use_app_state();
+                                    let cat = selected_category();
                                     spawn(async move {
                                         if let Err(e) = backend::actions::delete_feed(&state, id).await {
                                             *status_message.write() = format!("Delete failed: {e}");
@@ -124,9 +180,45 @@ pub fn App() -> Element {
                                         if selected_feed() == Some(id) {
                                             *selected_feed.write() = None;
                                         }
-                                        refresh_articles(state.clone(), selected_feed(), articles, status_message).await;
+                                        refresh_articles(state.clone(), selected_feed(), cat, articles, status_message).await;
                                     });
                                 },
+                            }
+                        }
+                    }
+                    h2 { class: "sidebar-section", "Categories" }
+                    if category_counts().is_empty() {
+                        div { class: "sidebar-empty", "Classifying articles…" }
+                    } else {
+                        ul { class: "category-list",
+                            li {
+                                class: if selected_category().is_none() { "category-item active" } else { "category-item" },
+                                onclick: move |_| {
+                                    *selected_category.write() = None;
+                                    let state = use_app_state();
+                                    let fid = selected_feed();
+                                    spawn(async move {
+                                        refresh_articles(state.clone(), fid, None, articles, status_message).await;
+                                    });
+                                },
+                                "All"
+                            }
+                            for (name, unread, total) in category_counts() {
+                                CategoryItem {
+                                    key: "{name}",
+                                    name: name.clone(),
+                                    unread,
+                                    total,
+                                    active: selected_category().as_deref() == Some(name.as_str()),
+                                    on_select: move |n: String| {
+                                        *selected_category.write() = Some(n.clone());
+                                        let state = use_app_state();
+                                        let fid = selected_feed();
+                                        spawn(async move {
+                                            refresh_articles(state.clone(), fid, Some(n), articles, status_message).await;
+                                        });
+                                    },
+                                }
                             }
                         }
                     }
@@ -135,12 +227,14 @@ pub fn App() -> Element {
                     h2 {
                         {
                             let id = selected_feed();
-                            match id {
-                                Some(id) => {
-                                    let title = feeds().iter().find(|f| f.id == id).map(|f| f.title.clone()).unwrap_or_else(|| "...".to_string());
-                                    format!("Articles: {title}")
-                                }
+                            let cat = selected_category();
+                            let feed_label = match id {
+                                Some(id) => feeds().iter().find(|f| f.id == id).map(|f| f.title.clone()).unwrap_or_else(|| "...".to_string()),
                                 None => "All articles".to_string(),
+                            };
+                            match cat {
+                                Some(c) => format!("{feed_label} · {c}"),
+                                None => feed_label,
                             }
                         }
                     }
@@ -164,8 +258,10 @@ pub fn App() -> Element {
                             article_id: id,
                             on_change: move |_| {
                                 let state = use_app_state();
+                                let cat = selected_category();
                                 spawn(async move {
-                                    refresh_articles(state.clone(), selected_feed(), articles, status_message).await;
+                                    refresh_articles(state.clone(), selected_feed(), cat, articles, status_message).await;
+                                    refresh_category_counts(state.clone(), category_counts, status_message).await;
                                 });
                             },
                         }
@@ -181,9 +277,10 @@ pub fn App() -> Element {
                 on_added: move |_| {
                     *show_add_feed.write() = false;
                     let state = use_app_state();
+                    let cat = selected_category();
                     spawn(async move {
                         refresh_feeds_list(state.clone(), feeds, status_message).await;
-                        refresh_articles(state.clone(), selected_feed(), articles, status_message).await;
+                        refresh_articles(state.clone(), selected_feed(), cat, articles, status_message).await;
                     });
                 },
             }
@@ -215,6 +312,7 @@ async fn refresh_feeds_list(
 async fn refresh_articles(
     state: crate::backend::AppState,
     feed_filter: Option<i64>,
+    category_filter: Option<String>,
     mut articles: Signal<Vec<Article>>,
     mut status: Signal<String>,
 ) {
@@ -224,12 +322,29 @@ async fn refresh_articles(
     };
     match backend::actions::ranked_articles(&state, feed_filter, half_life).await {
         Ok(list) => {
-            *status.write() = format!("{} article(s) ranked", list.len());
-            *articles.write() = list;
+            let filtered: Vec<Article> = if let Some(ref c) = category_filter {
+                list.into_iter()
+                    .filter(|a| a.category.as_deref() == Some(c.as_str()))
+                    .collect()
+            } else {
+                list
+            };
+            *status.write() = format!("{} article(s) shown", filtered.len());
+            *articles.write() = filtered;
         }
         Err(e) => {
             *status.write() = format!("Ranking failed: {e}");
         }
+    }
+}
+
+async fn refresh_category_counts(
+    state: crate::backend::AppState,
+    mut counts: Signal<Vec<(String, i64, i64)>>,
+    _status: Signal<String>,
+) {
+    if let Ok(list) = backend::actions::category_counts(&state).await {
+        *counts.write() = list;
     }
 }
 
@@ -259,6 +374,48 @@ fn FeedItem(
                 onclick: move |_| on_delete.call(id),
                 "×"
             }
+        }
+    }
+}
+
+#[component]
+fn CategoryItem(
+    name: String,
+    unread: i64,
+    total: i64,
+    active: bool,
+    on_select: EventHandler<String>,
+) -> Element {
+    let slug = category_slug(&name);
+    let class = if active {
+        "category-item active"
+    } else {
+        "category-item"
+    };
+    // When every article in the category has been read, dim the row
+    // (and the dot) so the user can still see the category exists but
+    // there's nothing new. Hover/active styles override.
+    let all_read = unread == 0 && total > 0;
+    let item_class = if all_read {
+        format!("{class} all-read")
+    } else {
+        class.to_string()
+    };
+    let dot_class = if all_read {
+        format!("category-dot category-{slug} dim")
+    } else {
+        format!("category-dot category-{slug}")
+    };
+    let count_label = if unread == 0 {
+        format!("{total}")
+    } else {
+        format!("{unread}/{total}")
+    };
+    rsx! {
+        li { class: "{item_class}", onclick: move |_| on_select.call(name.clone()),
+            span { class: "{dot_class}" }
+            span { class: "category-name", "{name}" }
+            span { class: "category-count", "{count_label}" }
         }
     }
 }
@@ -296,7 +453,16 @@ fn ArticleListItem(article: Article, active: bool, on_select: EventHandler<i64>)
             div { class: "article-list-meta",
                 span { class: "article-list-feed", "{article.feed_title}" }
                 span { class: "article-list-date", "{pub_str}" }
-                span { class: "article-list-score", "score: {article.score:.3}" }
+                if let Some(d) = article.display_score {
+                    span {
+                        class: "article-list-score",
+                        title: "AI preference rank (0–10). 10 = highest-ranked, 0 = lowest-ranked. List position may differ from rank when read articles are grouped below unread ones.",
+                        "{d:.1}"
+                    }
+                }
+                if let Some(cat) = &article.category {
+                    span { class: "category-pill category-{category_slug(cat)}", "{cat}" }
+                }
             }
         }
     }
@@ -378,13 +544,33 @@ fn ArticleView(article_id: i64, on_change: EventHandler<()>) -> Element {
         on_change.call(());
     };
 
+    // Same as `on_read_changed` but for vote changes. The vote buttons need
+    // to refresh the local article signal so the disabled state on the
+    // buttons (which depends on the article's current `vote` field) updates
+    // after Up/Down/Clear. Without this, clicking "Clear" on a Down-voted
+    // article would clear the vote in the DB but the Down button would
+    // stay disabled because the component is still rendering the stale
+    // `article` prop.
+    let vote_state = state.clone();
+    let mut vote_sig = reload_sig;
+    let on_vote_changed = move |_: ()| {
+        let state = vote_state.clone();
+        let id = article_id;
+        spawn(async move {
+            if let Ok(Some(a)) = backend::actions::get_article(&state, id).await {
+                vote_sig.set(Some(a));
+            }
+        });
+        on_change.call(());
+    };
+
     rsx! {
         div { class: "article-view-inner",
             match article() {
                 Some(a) => rsx! {
                     ArticleContent {
                         article: a,
-                        on_vote: on_change,
+                        on_vote: on_vote_changed,
                         on_content_changed: on_change,
                         on_read_changed: on_read_changed,
                     }
@@ -463,11 +649,15 @@ fn ArticleContent(
                 if let Some(a) = &article.author {
                     span { class: "article-author", "by {a}" }
                 }
+                if let Some(cat) = &article.category {
+                    span { class: "category-pill category-{category_slug(cat)}", "{cat}" }
+                }
             }
             h2 { class: "article-title", "{article.title}" }
             div { class: "article-vote-row",
                 button {
                     class: if vote == 1 { "btn btn-vote active" } else { "btn btn-vote" },
+                    disabled: vote == 1,
                     onclick: move |_| {
                         let state = up_state.clone();
                         let id = id;
@@ -480,6 +670,7 @@ fn ArticleContent(
                 }
                 button {
                     class: if vote == -1 { "btn btn-vote active" } else { "btn btn-vote" },
+                    disabled: vote == -1,
                     onclick: move |_| {
                         let state = down_state.clone();
                         let id = id;
@@ -492,6 +683,7 @@ fn ArticleContent(
                 }
                 button {
                     class: "btn",
+                    disabled: vote == 0,
                     onclick: move |_| {
                         let state = clear_state.clone();
                         let id = id;
@@ -695,6 +887,11 @@ fn SettingsDialog(on_close: EventHandler<()>) -> Element {
                                     ollama_chat_model: chat_model(),
                                     vote_weight: 1.0,
                                     time_half_life_hours: half_life().parse().unwrap_or(168.0),
+                                    category_labels: crate::backend::models::DEFAULT_CATEGORIES
+                                        .iter()
+                                        .map(|s| s.to_string())
+                                        .collect(),
+                                    category_weight: 1.0,
                                 };
                                 match backend::actions::save_settings(&state, &new_settings).await {
                                     Ok(()) => {

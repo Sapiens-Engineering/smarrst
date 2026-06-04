@@ -21,6 +21,57 @@ pub fn content_is_substantial(content: Option<&str>) -> bool {
     link_chars * 3 < text.len()
 }
 
+/// `true` if a URL's scheme and host are safe to fetch. Used both as a
+/// pre-flight check before issuing the request and as the predicate for
+/// the reqwest redirect policy. Hostnames (vs. literal IPs) are accepted;
+/// we can't resolve DNS synchronously, so DNS-rebinding is a known
+/// residual risk (a feed item linking to `attacker.com` that resolves to
+/// `127.0.0.1` would still be fetched).
+pub fn url_is_safe(url: &url::Url) -> bool {
+    let scheme = url.scheme();
+    if scheme != "http" && scheme != "https" {
+        return false;
+    }
+    match url.host() {
+        Some(url::Host::Ipv4(v4)) => !ip_is_blocked(&std::net::IpAddr::V4(v4)),
+        Some(url::Host::Ipv6(v6)) => !ip_is_blocked(&std::net::IpAddr::V6(v6)),
+        Some(url::Host::Domain(_)) => true,
+        None => false,
+    }
+}
+
+/// Same as [`url_is_safe`] but takes a string and returns a typed error.
+pub fn validate_public_url(url_str: &str) -> anyhow::Result<url::Url> {
+    let parsed = url::Url::parse(url_str).context("invalid url")?;
+    if !url_is_safe(&parsed) {
+        anyhow::bail!("refusing to fetch {url_str}: blocked scheme or host");
+    }
+    Ok(parsed)
+}
+
+fn ip_is_blocked(ip: &std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // unique local (fc00::/7)
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                // link-local (fe80::/10)
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
 pub fn strip_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_tag = false;
@@ -145,9 +196,11 @@ pub async fn extract_from_url(
     state: &AppState,
     url: &str,
 ) -> anyhow::Result<readability::extractor::Product> {
+    // SSRF guard: refuse to fetch loopback, private, or link-local hosts.
+    let parsed = validate_public_url(url).with_context(|| format!("refusing to fetch {url}"))?;
     let resp = state
         .http
-        .get(url)
+        .get(parsed.clone())
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
@@ -163,7 +216,6 @@ pub async fn extract_from_url(
     } else {
         &bytes[..]
     };
-    let parsed = url::Url::parse(url).context("invalid url")?;
     let mut cursor = Cursor::new(slice);
     let product = readability::extractor::extract(&mut cursor, &parsed)
         .map_err(|e| anyhow::anyhow!("readability: {e:?}"))?;
@@ -285,5 +337,65 @@ mod tests {
         assert!(markdown_looks_broken(js));
         let script = "before <script>alert(1)</script> after";
         assert!(markdown_looks_broken(script));
+    }
+
+    #[test]
+    fn validate_public_url_accepts_http_and_https() {
+        for s in [
+            "http://example.com/post",
+            "https://example.com/post",
+            "https://example.com:8080/path?q=1",
+        ] {
+            let parsed = validate_public_url(s).expect(s);
+            assert_eq!(parsed.as_str(), s);
+        }
+    }
+
+    #[test]
+    fn validate_public_url_rejects_non_http_schemes() {
+        for s in [
+            "file:///etc/passwd",
+            "ftp://example.com/feed",
+            "data:text/html,<script>alert(1)</script>",
+            "javascript:alert(1)",
+        ] {
+            assert!(validate_public_url(s).is_err(), "should reject {s}");
+        }
+    }
+
+    #[test]
+    fn url_is_safe_blocks_loopback_and_private_ips() {
+        for s in [
+            "http://127.0.0.1/x",
+            "http://127.0.0.1:8080/admin",
+            "http://10.0.0.1/x",
+            "http://10.255.255.255/x",
+            "http://172.16.0.1/x",
+            "http://192.168.1.1/x",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://0.0.0.0/x",
+            "http://255.255.255.255/x",
+            "http://[::1]/x",
+            "http://[::]/x",
+            "http://[fc00::1]/x",
+            "http://[fe80::1]/x",
+            "http://[ff02::1]/x",
+        ] {
+            let parsed = url::Url::parse(s).expect(s);
+            assert!(!url_is_safe(&parsed), "should block {s}");
+        }
+    }
+
+    #[test]
+    fn url_is_safe_accepts_hostnames_and_public_ips() {
+        for s in [
+            "http://example.com/x",
+            "https://news.ycombinator.com/rss",
+            "http://1.1.1.1/x",
+            "http://8.8.8.8:53/x",
+        ] {
+            let parsed = url::Url::parse(s).expect(s);
+            assert!(url_is_safe(&parsed), "should accept {s}");
+        }
     }
 }

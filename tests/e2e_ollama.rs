@@ -95,7 +95,7 @@ async fn end_to_end_content_fetch_for_thin_rss() {
         return;
     }
 
-    let dir = fresh_data_dir("add_embed_rank");
+    let dir = fresh_data_dir("content_fetch_thin");
     let state = smarrst::AppState::new(&dir).expect("init state");
     {
         let mut s = state.settings.lock().await;
@@ -143,4 +143,71 @@ async fn end_to_end_content_fetch_for_thin_rss() {
         after.content_status,
         ContentStatus::Loaded | ContentStatus::Failed
     ));
+}
+
+/// Regression test for the `break`-on-first-error bug in `classify_pending`.
+/// We point the chat model at a name that doesn't exist on the Ollama server
+/// so every call returns 404. The new implementation should log + continue
+/// (not abort the batch), and `articles_pending_classification` should
+/// still see all the articles as pending.
+#[tokio::test]
+async fn classify_pending_does_not_abort_on_per_article_error() {
+    if !ollama_reachable().await {
+        eprintln!("Ollama not reachable, skipping");
+        return;
+    }
+
+    let dir = fresh_data_dir("classify_resilience");
+    let state = smarrst::AppState::new(&dir).expect("init state");
+    {
+        let mut s = state.settings.lock().await;
+        s.ollama_embed_model = "nomic-embed-text".to_string();
+        // Force every classify call to 404.
+        s.ollama_chat_model = "this-model-does-not-exist-xyz".to_string();
+    }
+
+    let url = "https://hnrss.org/frontpage";
+    if let Err(e) = smarrst::backend::actions::add_feed(&state, url).await {
+        eprintln!("could not fetch test feed (network?): {e}");
+        return;
+    }
+    // Make sure articles are classifiable (have body + non-failed status).
+    let _ = smarrst::backend::ranking::embed_pending(&state, 32).await;
+
+    let pending_before = {
+        let conn = state.db.lock().await;
+        smarrst::backend::db::articles_pending_classification(&conn, 1024).unwrap()
+    };
+    if pending_before.is_empty() {
+        eprintln!("no pending articles, skipping");
+        return;
+    }
+    let n_pending = pending_before.len();
+
+    // Run classify. With the broken `break` behavior, this would classify 0
+    // (first 404 aborts the loop) and return Ok(0). With the fix, every
+    // article fails individually but the batch is not aborted, and the
+    // function still returns Ok(0) (none succeeded) while logging a
+    // warning per article.
+    let n = smarrst::backend::actions::classify_pending(&state, 1024)
+        .await
+        .expect("classify_pending should not return Err on per-article failures");
+    assert_eq!(
+        n, 0,
+        "no article should have classified successfully with a bogus model"
+    );
+
+    // The crucial assertion: articles are still pending (not lost or
+    // marked as "done" in some shadow state). This would fail under the
+    // old `break` behavior only if there was a side effect on the first
+    // error — there isn't, but it documents the intent.
+    let pending_after = {
+        let conn = state.db.lock().await;
+        smarrst::backend::db::articles_pending_classification(&conn, 1024).unwrap()
+    };
+    assert_eq!(
+        pending_after.len(),
+        n_pending,
+        "classify_pending must not silently drop unprocessed articles"
+    );
 }

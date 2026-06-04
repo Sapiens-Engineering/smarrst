@@ -1,4 +1,4 @@
-use crate::backend::models::Settings;
+use crate::backend::models::{Settings, DEFAULT_CATEGORIES};
 use rusqlite::{params, Connection};
 
 pub fn load(conn: &Connection) -> anyhow::Result<Settings> {
@@ -7,12 +7,23 @@ pub fn load(conn: &Connection) -> anyhow::Result<Settings> {
             .parse()
             .unwrap_or_else(|_| default.parse().unwrap_or(0.0)))
     };
+    let default_labels_json = serde_json::to_string(
+        &DEFAULT_CATEGORIES
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+    )?;
+    let labels_json = read_string(conn, "category_labels", &default_labels_json)?;
+    let category_labels: Vec<String> = serde_json::from_str(&labels_json)
+        .unwrap_or_else(|_| DEFAULT_CATEGORIES.iter().map(|s| s.to_string()).collect());
     Ok(Settings {
         ollama_url: read_string(conn, "ollama_url", "http://localhost:11434")?,
         ollama_embed_model: read_string(conn, "ollama_embed_model", "nomic-embed-text")?,
         ollama_chat_model: read_string(conn, "ollama_chat_model", "llama3.2")?,
         vote_weight: parse_f32("vote_weight", "1.0")?,
         time_half_life_hours: parse_f32("time_half_life_hours", "168.0")?,
+        category_labels,
+        category_weight: parse_f32("category_weight", "1.0")?,
     })
 }
 
@@ -26,6 +37,12 @@ pub fn save(conn: &Connection, s: &Settings) -> anyhow::Result<()> {
         "time_half_life_hours",
         &s.time_half_life_hours.to_string(),
     )?;
+    write_string(
+        conn,
+        "category_labels",
+        &serde_json::to_string(&s.category_labels)?,
+    )?;
+    write_string(conn, "category_weight", &s.category_weight.to_string())?;
     Ok(())
 }
 

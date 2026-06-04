@@ -34,8 +34,9 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls", "http2"], defaul
 regex = "1"
 
 # Async
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync"] }
 async-channel = "2"
+futures = "0.3"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

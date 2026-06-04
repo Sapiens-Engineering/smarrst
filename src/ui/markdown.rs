@@ -237,7 +237,7 @@ fn render_node(node: &MdNode) -> Element {
         MdNode::Image { src, alt } => rsx! {
             img { class: "md-img", src: "{src}", alt: "{alt}", loading: "lazy" }
         },
-        MdNode::Html(s) => rsx! { span { dangerous_inner_html: "{s}" } },
+        MdNode::Html(s) => rsx! { span { class: "md-html", "{s}" } },
     }
 }
 

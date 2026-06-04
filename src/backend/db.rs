@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS articles (
     content_status TEXT NOT NULL DEFAULT 'none',
     content_fetched_at TEXT,
     read_at TEXT,
+    category TEXT,
     UNIQUE(feed_id, guid),
     FOREIGN KEY(feed_id) REFERENCES feeds(id) ON DELETE CASCADE
 );
@@ -79,9 +80,16 @@ fn migrate_articles(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     if !cols.iter().any(|c| c == "content_markdown") {
         conn.execute("ALTER TABLE articles ADD COLUMN content_markdown TEXT", [])?;
     }
+    if !cols.iter().any(|c| c == "category") {
+        conn.execute("ALTER TABLE articles ADD COLUMN category TEXT", [])?;
+    }
     // The index on the (post-migration) column is safe to (re)create now.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_articles_content_status ON articles(content_status)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_articles_category ON articles(category)",
         [],
     )?;
     Ok(())
@@ -226,6 +234,7 @@ fn row_to_article(row: &Row<'_>) -> rusqlite::Result<Article> {
         .map_err(|e| {
             rusqlite::Error::InvalidColumnType(14, e.to_string(), rusqlite::types::Type::Text)
         })?;
+    let category: Option<String> = row.get(16)?;
     Ok(Article {
         id: row.get(0)?,
         feed_id: row.get(1)?,
@@ -240,9 +249,11 @@ fn row_to_article(row: &Row<'_>) -> rusqlite::Result<Article> {
         fetched_at,
         vote: row.get(10)?,
         score: row.get(11)?,
+        display_score: None,
         content_status: ContentStatus::from_db(&content_status),
         content_fetched_at,
         read_at,
+        category,
     })
 }
 
@@ -255,7 +266,8 @@ pub fn get_article(conn: &rusqlite::Connection, id: i64) -> anyhow::Result<Optio
                 a.content_status,
                 a.content_fetched_at,
                 a.read_at,
-                a.content_markdown
+                a.content_markdown,
+                a.category
          FROM articles a
          JOIN feeds f ON f.id = a.feed_id
          LEFT JOIN votes v ON v.article_id = a.id
@@ -275,10 +287,19 @@ pub fn set_vote(conn: &rusqlite::Connection, article_id: i64, vote: Vote) -> any
     Ok(())
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ScoredArticle {
-    pub id: i64,
-    pub score: f64,
+pub fn get_vote(conn: &rusqlite::Connection, article_id: i64) -> anyhow::Result<Vote> {
+    let raw: Option<i32> = conn
+        .query_row(
+            "SELECT vote FROM votes WHERE article_id = ?1",
+            params![article_id],
+            |r| r.get(0),
+        )
+        .ok();
+    Ok(match raw {
+        Some(1) => Vote::Up,
+        Some(-1) => Vote::Down,
+        _ => Vote::None,
+    })
 }
 
 pub fn articles_missing_scores(
@@ -293,7 +314,8 @@ pub fn articles_missing_scores(
                 a.content_status,
                 a.content_fetched_at,
                 a.read_at,
-                a.content_markdown
+                a.content_markdown,
+                a.category
          FROM articles a
          JOIN feeds f ON f.id = a.feed_id
          LEFT JOIN votes v ON v.article_id = a.id
@@ -322,7 +344,8 @@ pub fn articles_pending_content(
                 a.content_status,
                 a.content_fetched_at,
                 a.read_at,
-                a.content_markdown
+                a.content_markdown,
+                a.category
          FROM articles a
          JOIN feeds f ON f.id = a.feed_id
          LEFT JOIN votes v ON v.article_id = a.id
@@ -404,4 +427,95 @@ pub fn set_article_unread(conn: &rusqlite::Connection, id: i64) -> anyhow::Resul
         params![id],
     )?;
     Ok(())
+}
+
+pub fn set_article_category(
+    conn: &rusqlite::Connection,
+    id: i64,
+    category: &str,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE articles SET category = ?1 WHERE id = ?2",
+        params![category, id],
+    )?;
+    Ok(())
+}
+
+pub fn articles_pending_classification(
+    conn: &rusqlite::Connection,
+    limit: i64,
+) -> anyhow::Result<Vec<Article>> {
+    let mut stmt = conn.prepare(
+        "SELECT a.id, a.feed_id, f.title, a.title, a.url, a.author, a.summary, a.content,
+                a.published, a.fetched_at,
+                COALESCE(v.vote, 0) AS vote,
+                0.0 AS score,
+                a.content_status,
+                a.content_fetched_at,
+                a.read_at,
+                a.content_markdown,
+                a.category
+         FROM articles a
+         JOIN feeds f ON f.id = a.feed_id
+         LEFT JOIN votes v ON v.article_id = a.id
+         WHERE a.category IS NULL
+           AND a.content_status != 'failed'
+           AND (a.content IS NOT NULL OR a.summary IS NOT NULL OR a.title != '')
+         ORDER BY a.id DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit], row_to_article)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+pub fn count_votes_for_category(
+    conn: &rusqlite::Connection,
+    category: &str,
+) -> anyhow::Result<(i64, i64)> {
+    let up: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM votes v
+         JOIN articles a ON v.article_id = a.id
+         WHERE v.vote = 1 AND a.category = ?1",
+        params![category],
+        |r| r.get(0),
+    )?;
+    let down: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM votes v
+         JOIN articles a ON v.article_id = a.id
+         WHERE v.vote = -1 AND a.category = ?1",
+        params![category],
+        |r| r.get(0),
+    )?;
+    Ok((up, down))
+}
+
+/// Per-category counts: every category that has at least one article,
+/// with the unread count and the total count. Categories with zero
+/// unread (i.e. all articles marked read) still appear so the user can
+/// see the full landscape and click through to review them.
+pub fn category_counts(conn: &rusqlite::Connection) -> anyhow::Result<Vec<(String, i64, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT a.category,
+                SUM(CASE WHEN a.read_at IS NULL THEN 1 ELSE 0 END) AS unread,
+                COUNT(*) AS total
+         FROM articles a
+         WHERE a.category IS NOT NULL
+         GROUP BY a.category
+         ORDER BY a.category",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let c: Option<String> = r.get(0)?;
+        let unread: i64 = r.get(1)?;
+        let total: i64 = r.get(2)?;
+        Ok((c.unwrap_or_default(), unread, total))
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
 }

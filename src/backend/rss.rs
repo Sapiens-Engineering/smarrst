@@ -21,9 +21,12 @@ pub struct FetchedFeed {
 }
 
 pub async fn fetch_feed(state: &AppState, url: &str) -> anyhow::Result<FetchedFeed> {
+    // SSRF guard: refuse to fetch loopback, private, or link-local hosts.
+    let parsed_url = content::validate_public_url(url)
+        .with_context(|| format!("refusing to fetch feed {url}"))?;
     let body = state
         .http
-        .get(url)
+        .get(parsed_url)
         .send()
         .await
         .with_context(|| format!("fetching {url}"))?

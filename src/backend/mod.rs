@@ -31,6 +31,18 @@ impl AppState {
             http: reqwest::Client::builder()
                 .user_agent(USER_AGENT)
                 .timeout(std::time::Duration::from_secs(30))
+                // Reject any redirect target whose host is a loopback /
+                // private / link-local IP. This is the second line of
+                // defense behind `content::validate_public_url`, which
+                // guards the initial request URL.
+                .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                    if content::url_is_safe(attempt.url()) {
+                        attempt.follow()
+                    } else {
+                        let blocked = attempt.url().to_string();
+                        attempt.error(format!("blocked redirect to {blocked}"))
+                    }
+                }))
                 // Prefer HTTP/2 via ALPN where the server supports it; fall
                 // back to HTTP/1.1 otherwise. (Using `http2_prior_knowledge`
                 // would break the many sites that still speak only h1.1.)
