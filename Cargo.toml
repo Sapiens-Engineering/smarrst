@@ -1,0 +1,62 @@
+[package]
+name = "smarrst"
+version = "0.1.0"
+edition = "2021"
+description = "Smart RSS reader with AI-powered preference learning"
+authors = ["smarrst contributors"]
+
+[lib]
+name = "smarrst"
+path = "src/lib.rs"
+
+[[bin]]
+name = "smarrst"
+path = "src/main.rs"
+
+[dependencies]
+dioxus = { version = "0.7", features = ["desktop"] }
+dioxus-desktop = "0.7"
+
+# RSS
+feed-rs = "2"
+
+# Content extraction
+readability = "0.3"
+url = "2"
+htmd = "0.5"
+pulldown-cmark = "0.13"
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# HTTP
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "http2"], default-features = false }
+regex = "1"
+
+# Async
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+async-channel = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Paths
+dirs = "5"
+
+# Utilities
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

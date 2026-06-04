@@ -1,0 +1,8 @@
+/target
+/Cargo.lock
+.DS_Store
+smarrst.db
+smarrst.db-journal
+smarrst.db-wal
+smarrst.db-shm
+*.swp
