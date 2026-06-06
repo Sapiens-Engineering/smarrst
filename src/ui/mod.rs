@@ -91,7 +91,15 @@ pub fn App() -> Element {
             if let Err(e) = backend::ranking::embed_pending(&state, 256).await {
                 log::warn!("startup embedding failed: {e}");
             }
-            refresh_articles(state, selected_feed(), cat, articles, status_message, list_version).await;
+            refresh_articles(
+                state,
+                selected_feed(),
+                cat,
+                articles,
+                status_message,
+                list_version,
+            )
+            .await;
         });
     });
 

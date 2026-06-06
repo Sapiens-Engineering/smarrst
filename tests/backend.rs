@@ -77,6 +77,7 @@ fn schema_upgrades_legacy_articles_table() {
     assert!(cols.iter().any(|c| c == "content_status"));
     assert!(cols.iter().any(|c| c == "read_at"));
     assert!(cols.iter().any(|c| c == "content_markdown"));
+    assert!(cols.iter().any(|c| c == "canonical_url"));
 
     // Index on category exists.
     let idx_count: i64 = conn
@@ -88,6 +89,310 @@ fn schema_upgrades_legacy_articles_table() {
         )
         .unwrap();
     assert_eq!(idx_count, 1, "idx_articles_category should exist");
+
+    // Cross-feed dedup index exists (created after the backfill +
+    // collapse-duplicates migration step).
+    let canonical_idx: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type='index' AND name='idx_articles_canonical_url'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(canonical_idx, 1, "idx_articles_canonical_url should exist");
+}
+
+/// A database created before the `canonical_url` feature, with two
+/// feeds pointing at the same article, must be deduped on first launch
+/// after the upgrade. The migration keeps the oldest row (lowest id)
+/// and deletes the rest. New inserts after the migration are blocked
+/// by the unique partial index.
+#[test]
+fn migration_collapses_existing_cross_feed_duplicates() {
+    let conn = open_memory();
+
+    // Pre-canonical_url schema: identical to the current SCHEMA minus
+    // the canonical_url column, the unique partial index, and the
+    // post-migration category column (so the migration path is the
+    // one being exercised).
+    conn.execute_batch(
+        "CREATE TABLE feeds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            description TEXT,
+            last_fetched TEXT,
+            created_at TEXT NOT NULL
+         );
+         CREATE TABLE articles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            feed_id INTEGER NOT NULL,
+            guid TEXT NOT NULL,
+            title TEXT NOT NULL,
+            url TEXT NOT NULL,
+            author TEXT,
+            summary TEXT,
+            content TEXT,
+            content_markdown TEXT,
+            published TEXT,
+            fetched_at TEXT NOT NULL,
+            embedding TEXT,
+            content_status TEXT NOT NULL DEFAULT 'none',
+            content_fetched_at TEXT,
+            read_at TEXT,
+            UNIQUE(feed_id, guid),
+            FOREIGN KEY(feed_id) REFERENCES feeds(id) ON DELETE CASCADE
+         );
+         CREATE TABLE votes (
+            article_id INTEGER PRIMARY KEY,
+            vote INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(article_id) REFERENCES articles(id) ON DELETE CASCADE
+         );
+         CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         CREATE INDEX idx_articles_feed ON articles(feed_id);
+         CREATE INDEX idx_articles_published ON articles(published);",
+    )
+    .expect("create pre-canonical schema");
+
+    let feed_a = db::add_feed(&conn, "https://hn-a.example/rss", "A", None).unwrap();
+    let feed_b = db::add_feed(&conn, "https://hn-b.example/rss", "B", None).unwrap();
+
+    // Two rows that should collapse to one. The lower id wins; the
+    // higher id is deleted.
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO articles
+            (feed_id, guid, title, url, fetched_at)
+         VALUES (?1, 'g1', 'Show HN: foo', 'https://example.com/p?utm_source=a', ?2)",
+        rusqlite::params![feed_a, now],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO articles
+            (feed_id, guid, title, url, fetched_at)
+         VALUES (?1, 'g2', 'Show HN: foo', 'HTTPS://www.example.com/p/', ?2)",
+        rusqlite::params![feed_b, now],
+    )
+    .unwrap();
+    // An unrelated article that should NOT be touched.
+    conn.execute(
+        "INSERT INTO articles
+            (feed_id, guid, title, url, fetched_at)
+         VALUES (?1, 'g3', 'Other', 'https://other.example/q', ?2)",
+        rusqlite::params![feed_a, now],
+    )
+    .unwrap();
+
+    // Run the upgrade migration.
+    db::init_schema(&conn).expect("upgrade");
+
+    // Two rows total: the unrelated one and the deduped one. The deduped
+    // row is the one originally inserted into feed_a (id 1, the
+    // lowest), and its original URL is preserved.
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM articles", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 2, "duplicates should be collapsed during migration");
+
+    let kept: (i64, String) = conn
+        .query_row(
+            "SELECT id, url FROM articles WHERE title = 'Show HN: foo'",
+            [],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(kept.0, 1, "lowest id wins; the older feed_a row is kept");
+    assert_eq!(
+        kept.1, "https://example.com/p?utm_source=a",
+        "original URL is preserved (not the canonical form)"
+    );
+
+    // canonical_url was backfilled on both surviving rows.
+    let canonical: Option<String> = conn
+        .query_row("SELECT canonical_url FROM articles WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        canonical.as_deref(),
+        Some("https://example.com/p"),
+        "tracking param dropped, www. stripped, path trailing slash removed, scheme lowercased"
+    );
+
+    // And the unique partial index blocks a re-introduction: trying to
+    // re-insert via the public API with a URL that canonicalizes to the
+    // same form must be rejected.
+    let dup = db::insert_article(
+        &conn,
+        feed_b,
+        "g4",
+        "Re-introduced",
+        "https://EXAMPLE.com/p",
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("insert call");
+    assert!(
+        dup.is_none(),
+        "should be blocked by canonical_url unique index"
+    );
+}
+
+/// A pre-feature database with two aggregator-post duplicates (Lobsters
+/// and HN pointing at the same story, different URLs) must be deduped
+/// on the first launch after the title+date migration. Runs after the
+/// canonical-URL dedup has already removed any URL-level duplicates.
+#[test]
+fn migration_collapses_existing_aggregator_post_duplicates() {
+    let conn = open_memory();
+
+    // Pre-canonical-url AND pre-title-dedup schema. Both migrations
+    // should fire in order: canonical_url first (no-op here because
+    // the URLs are all different), then title+day.
+    conn.execute_batch(
+        "CREATE TABLE feeds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            description TEXT,
+            last_fetched TEXT,
+            created_at TEXT NOT NULL
+         );
+         CREATE TABLE articles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            feed_id INTEGER NOT NULL,
+            guid TEXT NOT NULL,
+            title TEXT NOT NULL,
+            url TEXT NOT NULL,
+            author TEXT,
+            summary TEXT,
+            content TEXT,
+            content_markdown TEXT,
+            published TEXT,
+            fetched_at TEXT NOT NULL,
+            embedding TEXT,
+            content_status TEXT NOT NULL DEFAULT 'none',
+            content_fetched_at TEXT,
+            read_at TEXT,
+            category TEXT,
+            UNIQUE(feed_id, guid),
+            FOREIGN KEY(feed_id) REFERENCES feeds(id) ON DELETE CASCADE
+         );
+         CREATE TABLE votes (
+            article_id INTEGER PRIMARY KEY,
+            vote INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(article_id) REFERENCES articles(id) ON DELETE CASCADE
+         );
+         CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         CREATE INDEX idx_articles_feed ON articles(feed_id);
+         CREATE INDEX idx_articles_published ON articles(published);",
+    )
+    .expect("create pre-migration schema");
+
+    let lobsters = db::add_feed(&conn, "https://lobste.rs/rss", "Lobsters", None).unwrap();
+    let hn = db::add_feed(&conn, "https://hn.example/rss", "HN", None).unwrap();
+
+    // Same story, two feeds, two completely different URLs, two
+    // different GUIDs, two different authors, four hours apart in
+    // publication time but same calendar day.
+    let day = chrono::DateTime::parse_from_rfc3339("2026-06-03T08:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let later = day + chrono::Duration::hours(4);
+    let day_str = day.format("%Y-%m-%d").to_string();
+    let later_str = later.to_rfc3339();
+
+    // Lobsters post, inserted first (lowest id) — wins the keep.
+    conn.execute(
+        "INSERT INTO articles (feed_id, guid, title, url, author, published, fetched_at)
+         VALUES (?1, 'g1', 'A Post-Quantum Future for Let''s Encrypt',
+                 'https://lobste.rs/s/abc', 'alice', ?2, ?3)",
+        rusqlite::params![lobsters, day.to_rfc3339(), day.to_rfc3339()],
+    )
+    .unwrap();
+    // HN post about the same story, inserted second.
+    conn.execute(
+        "INSERT INTO articles (feed_id, guid, title, url, author, published, fetched_at)
+         VALUES (?1, 'g2', 'A Post-Quantum Future for Let''s Encrypt',
+                 'https://news.ycombinator.com/item?id=99999', 'SGran', ?2, ?3)",
+        rusqlite::params![hn, later_str, later_str],
+    )
+    .unwrap();
+    // Unrelated article, must be untouched.
+    conn.execute(
+        "INSERT INTO articles (feed_id, guid, title, url, fetched_at)
+         VALUES (?1, 'g3', 'Something else entirely', 'https://other.example/q', ?2)",
+        rusqlite::params![lobsters, day.to_rfc3339()],
+    )
+    .unwrap();
+    // Same story *on a different day* — must NOT be collapsed (e.g. a
+    // syndicated republication the next week).
+    let next_week = day + chrono::Duration::days(7);
+    conn.execute(
+        "INSERT INTO articles (feed_id, guid, title, url, fetched_at)
+         VALUES (?1, 'g4', 'A Post-Quantum Future for Let''s Encrypt',
+                 'https://example.com/repub', ?2)",
+        rusqlite::params![hn, next_week.to_rfc3339()],
+    )
+    .unwrap();
+
+    // Run the full upgrade migration. This must add canonical_url
+    // and title_hash/pub_day columns, backfill them, collapse the
+    // aggregator-post duplicate, and create both unique indexes.
+    db::init_schema(&conn).expect("upgrade");
+
+    // Expect: unrelated article + the kept (Lobsters) post + the
+    // next-week republication = 3 rows. The HN post was deduped.
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM articles", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 3,
+        "aggregator-post duplicate should be collapsed; next-week republication kept"
+    );
+
+    // The kept row is the Lobsters post (lowest id, oldest insert).
+    let kept: (i64, String) = conn
+        .query_row(
+            "SELECT id, url FROM articles
+             WHERE title = 'A Post-Quantum Future for Let''s Encrypt'
+               AND pub_day = ?1",
+            rusqlite::params![day_str],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(kept.0, 1, "lowest-id row wins");
+    assert_eq!(
+        kept.1, "https://lobste.rs/s/abc",
+        "original URL preserved, not the canonical form"
+    );
+
+    // The next-week republication survives (different pub_day).
+    let next: Option<String> = conn
+        .query_row(
+            "SELECT url FROM articles WHERE pub_day = '2026-06-10'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(next.as_deref(), Some("https://example.com/repub"));
+
+    // The unique partial index on (title_hash, pub_day) is in place.
+    let idx: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type='index' AND name='idx_articles_title_day'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(idx, 1, "idx_articles_title_day should exist");
 }
 
 #[test]
@@ -140,6 +445,234 @@ fn insert_article_dedupes_by_guid() {
     )
     .expect("insert");
     assert!(second.is_none(), "duplicate guid should be ignored");
+}
+
+/// Two feeds pointing at the same article (e.g. two HN mirrors using
+/// different GUIDs) should collapse to a single row, keyed on the
+/// canonical form of the URL. Tracking params, scheme case, and
+/// `www.` prefix must not produce duplicates.
+#[test]
+fn insert_article_dedupes_across_feeds_via_canonical_url() {
+    let conn = open_memory();
+    db::init_schema(&conn).expect("init");
+
+    let feed_a = db::add_feed(&conn, "https://hn-a.example/rss", "HN A", None).unwrap();
+    let feed_b = db::add_feed(&conn, "https://hn-b.example/rss", "HN B", None).unwrap();
+
+    let id_a = db::insert_article(
+        &conn,
+        feed_a,
+        "guid-aaa",
+        "Show HN: foo",
+        "https://news.ycombinator.com/item?id=123",
+        None,
+        Some("from feed A"),
+        None,
+        None,
+        None,
+    )
+    .expect("insert A")
+    .expect("A inserted");
+
+    // Same article from feed B, but the URL has a different scheme case,
+    // a `www.` prefix, and a tracking param. The canonical form should
+    // match feed A's row, so the insert is ignored.
+    let id_b = db::insert_article(
+        &conn,
+        feed_b,
+        "guid-bbb",
+        "Show HN: foo",
+        "HTTPS://www.news.ycombinator.com/item?id=123&utm_source=hn-b",
+        None,
+        Some("from feed B"),
+        None,
+        None,
+        None,
+    )
+    .expect("insert B call");
+
+    // B's row should have collapsed into A's via the canonical_url
+    // unique index, so the call returns Ok(None). The first insert
+    // wins; the row is attributed to feed A and the original URL is
+    // preserved (not the canonical form), so the "Open in browser"
+    // link still works with whatever tracking params the publisher
+    // embedded.
+    assert!(id_b.is_none(), "B's row should be deduped by canonical_url");
+    let kept = db::get_article(&conn, id_a).unwrap().expect("article");
+    assert_eq!(kept.feed_id, feed_a);
+    assert_eq!(kept.url, "https://news.ycombinator.com/item?id=123");
+    assert_eq!(
+        kept.canonical_url.as_deref(),
+        Some("https://news.ycombinator.com/item?id=123"),
+        "canonical_url is the lowercased/normalized form"
+    );
+}
+
+/// Two aggregator feeds (e.g. Lobsters + HN) reporting on the same
+/// underlying story have different URLs and different GUIDs, so the
+/// `canonical_url` index cannot dedup them. The `(title_hash, pub_day)`
+/// index catches the case: same headline + same publication day =
+/// same story.
+#[test]
+fn insert_article_dedupes_aggregator_posts_via_title_and_day() {
+    let conn = open_memory();
+    db::init_schema(&conn).expect("init");
+
+    let lobsters = db::add_feed(&conn, "https://lobste.rs/rss", "Lobsters", None).unwrap();
+    let hn = db::add_feed(&conn, "https://news.ycombinator.com/rss", "HN", None).unwrap();
+
+    let published = chrono::DateTime::parse_from_rfc3339("2026-06-03T15:06:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    let id_lobsters = db::insert_article(
+        &conn,
+        lobsters,
+        "lobsters-abc",
+        "A Post-Quantum Future for Let's Encrypt",
+        "https://lobste.rs/s/abc/post_quantum",
+        Some("alice"),
+        Some("from lobsters"),
+        None,
+        None,
+        Some(published),
+    )
+    .expect("insert A call")
+    .expect("lobsters row inserted");
+
+    // HN picked up the same story four hours later under its own
+    // GUID, with a completely different URL and a different author.
+    // URL-based dedup can't help here; only the title+date match.
+    let id_hn = db::insert_article(
+        &conn,
+        hn,
+        "hn-xyz",
+        "A Post-Quantum Future for Let's Encrypt",
+        "https://news.ycombinator.com/item?id=99999",
+        Some("SGran"),
+        Some("from hn"),
+        None,
+        None,
+        Some(published + chrono::Duration::hours(4)),
+    )
+    .expect("insert B call");
+    assert!(
+        id_hn.is_none(),
+        "HN row should be deduped by (title_hash, pub_day)"
+    );
+
+    let kept = db::get_article(&conn, id_lobsters)
+        .unwrap()
+        .expect("article");
+    assert_eq!(
+        kept.feed_id, lobsters,
+        "older feed (Lobsters) keeps the row"
+    );
+    assert_eq!(kept.author.as_deref(), Some("alice"));
+    assert_eq!(
+        kept.title_hash.as_deref(),
+        Some("a post-quantum future for let's encrypt")
+    );
+    assert_eq!(kept.pub_day.as_deref(), Some("2026-06-03"));
+}
+
+/// Same title on a *different* day is a different story and must NOT
+/// be collapsed. This is the trade-off the user accepted: a weekly
+/// newsletter titled the same on successive days would not dedup.
+#[test]
+fn insert_article_keeps_same_title_on_different_days() {
+    let conn = open_memory();
+    db::init_schema(&conn).expect("init");
+
+    let feed = db::add_feed(&conn, "https://example.com/rss", "F", None).unwrap();
+
+    let day1 = chrono::DateTime::parse_from_rfc3339("2026-06-01T08:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let day2 = day1 + chrono::Duration::days(1);
+
+    let id1 = db::insert_article(
+        &conn,
+        feed,
+        "g1",
+        "Daily digest",
+        "https://example.com/1",
+        None,
+        None,
+        None,
+        None,
+        Some(day1),
+    )
+    .expect("insert 1")
+    .expect("1 inserted");
+    let id2 = db::insert_article(
+        &conn,
+        feed,
+        "g2",
+        "Daily digest",
+        "https://example.com/2",
+        None,
+        None,
+        None,
+        None,
+        Some(day2),
+    )
+    .expect("insert 2")
+    .expect("2 inserted: different day");
+    assert_ne!(id1, id2);
+
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM articles", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 2, "same title on different days must not dedup");
+}
+
+/// Whitespace / case differences in titles must still match: a feed
+/// that double-spaces or capitalizes a headline is the same story as
+/// one that doesn't.
+#[test]
+fn insert_article_dedup_title_is_case_and_whitespace_insensitive() {
+    let conn = open_memory();
+    db::init_schema(&conn).expect("init");
+    let feed_a = db::add_feed(&conn, "https://a.example/rss", "A", None).unwrap();
+    let feed_b = db::add_feed(&conn, "https://b.example/rss", "B", None).unwrap();
+    let day = chrono::DateTime::parse_from_rfc3339("2026-06-03T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    db::insert_article(
+        &conn,
+        feed_a,
+        "g1",
+        "Hello   World",
+        "https://a/x",
+        None,
+        None,
+        None,
+        None,
+        Some(day),
+    )
+    .expect("insert 1")
+    .expect("1 ok");
+    let dup = db::insert_article(
+        &conn,
+        feed_b,
+        "g2",
+        "  hello world\n",
+        "https://b/y",
+        None,
+        None,
+        None,
+        None,
+        Some(day),
+    )
+    .expect("insert 2 call");
+    assert!(dup.is_none(), "case + whitespace variants must dedup");
+
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM articles", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
 }
 
 #[test]
@@ -619,7 +1152,7 @@ fn articles_pending_classification_filters() {
         Some("Tech"),
         models::ContentStatus::None,
     );
-    let failed = insert_article_with_status(
+    let failed_fetch = insert_article_with_status(
         &conn,
         feed_id,
         "g3",
@@ -628,16 +1161,6 @@ fn articles_pending_classification_filters() {
         None,
         models::ContentStatus::Failed,
     );
-    let no_body = insert_article_with_status(
-        &conn,
-        feed_id,
-        "g4",
-        "T4",
-        "",
-        None,
-        models::ContentStatus::None,
-    );
-    let _ = no_body;
 
     let pending: Vec<i64> = db::articles_pending_classification(&conn, 100)
         .unwrap()
@@ -646,7 +1169,13 @@ fn articles_pending_classification_filters() {
         .collect();
     assert!(pending.contains(&uncategorized));
     assert!(!pending.contains(&already_categorized));
-    assert!(!pending.contains(&failed));
+    // Failed content fetches no longer block classification: the
+    // title + summary alone are enough for the model to pick a label,
+    // and excluding these would leave the article stuck with
+    // `category = NULL` forever. The Rust-side filter in
+    // `classify_pending_with_concurrency` then drops inputs whose
+    // combined title+summary+content is actually empty.
+    assert!(pending.contains(&failed_fetch));
 }
 
 #[test]
@@ -930,6 +1459,9 @@ fn make_article(id: i64, score: f64) -> models::Article {
         content_fetched_at: None,
         read_at: None,
         category: None,
+        canonical_url: None,
+        title_hash: None,
+        pub_day: None,
     }
 }
 

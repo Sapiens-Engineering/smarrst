@@ -63,6 +63,23 @@ pub struct Article {
     pub content_fetched_at: Option<DateTime<Utc>>,
     pub read_at: Option<DateTime<Utc>>,
     pub category: Option<String>,
+    /// Normalized form of `url` (lowercase scheme/host, no `www.`,
+    /// tracking params dropped, query sorted, fragment stripped,
+    /// trailing slash stripped). Two articles from different feeds
+    /// that point to the same page share a `canonical_url`, which is
+    /// what the cross-feed unique index in `db.rs` enforces. `None`
+    /// when the original URL couldn't be parsed.
+    pub canonical_url: Option<String>,
+    /// Normalized title (trim, lowercase, whitespace collapsed). Used
+    /// together with `pub_day` to dedup aggregator posts that report
+    /// on the same story (Lobsters + HN pointing at the same blog
+    /// post): same title + same publication day = same story. `None`
+    /// for articles with an empty/whitespace-only title.
+    pub title_hash: Option<String>,
+    /// Publication date in `YYYY-MM-DD` form, from `published` (or
+    /// `fetched_at` if `published` is missing). Paired with
+    /// `title_hash` to scope title-based dedup to a single day.
+    pub pub_day: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

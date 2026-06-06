@@ -7,6 +7,7 @@ pub mod ranking;
 pub mod refresh;
 pub mod rss;
 pub mod settings;
+pub mod url_norm;
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
