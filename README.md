@@ -8,6 +8,8 @@ Smart RSS reader with AI-powered preference learning. Pure Rust, Tauri/wry-based
 
 Smarrst is a small, opinionated feed reader. You add RSS feeds, the app fetches and embeds the articles through a local Ollama model, and you vote each article up or down. The running vote history becomes a *preference vector*; new articles are ranked by cosine similarity to that vector plus a time decay so fresher things float up unless you consistently vote them down. Articles are also auto-classified into one of a fixed list of categories (AI, Cryptography, Philosophy, Psychology, Tech, Politics, Science, Business, Culture, Sports, Gaming, Other), and the app keeps a *separate* preference vector per category so your votes on, say, Philosophy articles don't bleed into your AI rankings.
 
+![smaRRSt UI](ui.png)
+
 ## Highlights
 
 - **Pure Rust stack.** RSS parsing, persistence, networking, UI — Rust end to end. The UI is [Dioxus 0.7](https://dioxuslabs.com) running on the same wry/tao stack Tauri uses.
