@@ -1,5 +1,9 @@
 # smarrst
 
+> ## ⚠️ VIBE-CODED POC — UNMAINTAINED — NO GUARANTEES
+>
+> This is a throwaway proof-of-concept YOLO'd together to stress-test MiniMax M3 while it was free; it has not been security-reviewed, the ranking and content pipelines are best-effort hacks that may silently drop or mangle articles, and the author will not fix bugs, accept PRs, or respond to reports. Will take complaints on [Twitter](https://x.com/sapiens_eng). Use a real RSS reader.
+
 Smart RSS reader with AI-powered preference learning. Pure Rust, Tauri/wry-based desktop UI, Ollama for embeddings.
 
 Smarrst is a small, opinionated feed reader. You add RSS feeds, the app fetches and embeds the articles through a local Ollama model, and you vote each article up or down. The running vote history becomes a *preference vector*; new articles are ranked by cosine similarity to that vector plus a time decay so fresher things float up unless you consistently vote them down. Articles are also auto-classified into one of a fixed list of categories (AI, Cryptography, Philosophy, Psychology, Tech, Politics, Science, Business, Culture, Sports, Gaming, Other), and the app keeps a *separate* preference vector per category so your votes on, say, Philosophy articles don't bleed into your AI rankings.
