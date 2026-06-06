@@ -1,6 +1,44 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// How the article list is ordered on screen. Both modes compute the
+/// underlying AI-rank score (and the stable `display_score` percentile)
+/// the same way; they only differ in the final visual sort applied to
+/// the ranked list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SortMode {
+    /// Sort by publication date desc (`published` falling back to
+    /// `fetched_at`). Read and unread articles are interleaved; the
+    /// user controls visibility with `ListFilter`. This is the
+    /// default — most users care about what's new, not the AI's
+    /// preference order.
+    #[default]
+    Time,
+    /// Sort by score desc, then group read articles below unread ones
+    /// (stable within each group). Within each group the score-desc
+    /// order is preserved. This is the "AI preference ranking with
+    /// read-state visual grouping" view.
+    Rating,
+}
+
+/// Which articles are visible in the list, given their read state
+/// and (in `All` mode) a read-staleness cutoff.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ListFilter {
+    /// Show only unread articles. This is the default — once you've
+    /// read an article it's out of your way.
+    #[default]
+    UnreadOnly,
+    /// Show all articles, but hide read articles whose `read_at` is
+    /// older than the configured `time_half_life_hours` cutoff. The
+    /// cutoff keeps the read pile from accumulating forever; recent
+    /// reads stay visible so you can re-find them.
+    All,
+    /// Show only read articles. No time cutoff — the user is
+    /// explicitly looking at the read pile (e.g. to re-find something).
+    ReadOnly,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Feed {
     pub id: i64,

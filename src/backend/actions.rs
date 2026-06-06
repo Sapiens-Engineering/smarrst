@@ -1,6 +1,7 @@
 use crate::backend::db;
-use crate::backend::models::{Article, ContentStatus, Feed, Settings, Vote};
+use crate::backend::models::{Article, ContentStatus, Feed, ListFilter, Settings, SortMode, Vote};
 use crate::backend::{content, ollama, ranking, rss, AppState};
+use chrono::{DateTime, Utc};
 use tokio::task;
 
 // Each public action runs its synchronous SQLite work inside spawn_blocking
@@ -154,6 +155,7 @@ pub async fn ranked_articles(
     state: &AppState,
     feed_filter: Option<i64>,
     half_life_hours: f32,
+    sort_mode: SortMode,
 ) -> anyhow::Result<Vec<Article>> {
     let (pref, scored) = {
         let db = state.db.clone();
@@ -209,26 +211,39 @@ pub async fn ranked_articles(
     let mut articles = articles;
     // Sort by score descending first. This is the "raw" ranking; it's
     // what feeds the display_score percentile below. `sort_by` is
-    // stable, so the subsequent re-sort by read state preserves the
-    // score-based order within each group.
+    // stable, so the subsequent re-sort preserves the score-based
+    // order within each group.
     articles.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    // Assign the 0..=10 percentile *before* the read-state re-sort, so
+    // Assign the 0..=10 percentile *before* the display re-sort, so
     // that reading an article doesn't change its rating. The score is
-    // the AI's preference rank, which is independent of read state. The
-    // re-sort below only changes visual grouping, not the rating.
+    // the AI's preference rank, which is independent of read state and
+    // sort mode. The re-sort below only changes visual ordering, not
+    // the rating.
     assign_display_scores(&mut articles);
-    // Re-sort for display: unread articles at the top, read at the
-    // bottom. Within each group, score-descending order is preserved
-    // by sort_by's stability.
-    articles.sort_by(|a, b| {
-        let a_read = a.read_at.is_some();
-        let b_read = b.read_at.is_some();
-        a_read.cmp(&b_read)
-    });
+    // Apply the display sort. Time mode is the new default: list by
+    // publication date desc (fetched_at fallback) — read and unread
+    // are interleaved. Rating mode is the legacy behaviour: group
+    // unread above read, score-desc within each group.
+    match sort_mode {
+        SortMode::Time => {
+            articles.sort_by(|a, b| {
+                let a_dt = a.published.unwrap_or(a.fetched_at);
+                let b_dt = b.published.unwrap_or(b.fetched_at);
+                b_dt.cmp(&a_dt)
+            });
+        }
+        SortMode::Rating => {
+            articles.sort_by(|a, b| {
+                let a_read = a.read_at.is_some();
+                let b_read = b.read_at.is_some();
+                a_read.cmp(&b_read)
+            });
+        }
+    }
     Ok(articles)
 }
 
@@ -244,6 +259,27 @@ pub fn assign_display_scores(articles: &mut [Article]) {
     let denom = (n - 1).max(1) as f32;
     for (i, a) in articles.iter_mut().enumerate() {
         a.display_score = Some(10.0 * (1.0 - (i as f32) / denom));
+    }
+}
+
+/// Whether the article should be visible in the list given the current
+/// filter and (in `All` mode) a read-staleness cutoff. Pure function —
+/// extracted for testing. Caller is responsible for picking the cutoff
+/// timestamp, which is `now - time_half_life_hours` for the auto-hide
+/// feature.
+pub fn should_show(article: &Article, filter: ListFilter, hide_cutoff: DateTime<Utc>) -> bool {
+    let is_read = article.read_at.is_some();
+    match filter {
+        ListFilter::UnreadOnly => !is_read,
+        ListFilter::All => {
+            if !is_read {
+                true
+            } else {
+                // Safe: `is_read` implies `read_at.is_some()`.
+                article.read_at.expect("is_read implies read_at is Some") >= hide_cutoff
+            }
+        }
+        ListFilter::ReadOnly => is_read,
     }
 }
 

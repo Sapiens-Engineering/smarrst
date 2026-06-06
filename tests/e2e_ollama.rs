@@ -55,9 +55,14 @@ async fn end_to_end_add_feed_embed_rank() {
     assert!(n > 0, "should have embedded at least one article");
 
     // Rank articles.
-    let ranked = smarrst::backend::actions::ranked_articles(&state, None, 168.0)
-        .await
-        .expect("rank");
+    let ranked = smarrst::backend::actions::ranked_articles(
+        &state,
+        None,
+        168.0,
+        smarrst::backend::models::SortMode::default(),
+    )
+    .await
+    .expect("rank");
     assert!(!ranked.is_empty());
 
     // Every ranked article should have a non-zero score: time-decay alone
@@ -72,9 +77,14 @@ async fn end_to_end_add_feed_embed_rank() {
     if let Some(top) = ranked.first().cloned() {
         let top_id = top.id;
         let _ = smarrst::backend::actions::vote(&state, top_id, 1).await;
-        let after = smarrst::backend::actions::ranked_articles(&state, None, 168.0)
-            .await
-            .expect("re-rank");
+        let after = smarrst::backend::actions::ranked_articles(
+            &state,
+            None,
+            168.0,
+            smarrst::backend::models::SortMode::default(),
+        )
+        .await
+        .expect("re-rank");
         assert!(!after.is_empty());
         assert_eq!(
             after.first().unwrap().id,
@@ -114,9 +124,14 @@ async fn end_to_end_content_fetch_for_thin_rss() {
         .await
         .expect("embed");
     eprintln!("embedded {n} articles");
-    let ranked = smarrst::backend::actions::ranked_articles(&state, None, 168.0)
-        .await
-        .expect("rank");
+    let ranked = smarrst::backend::actions::ranked_articles(
+        &state,
+        None,
+        168.0,
+        smarrst::backend::models::SortMode::default(),
+    )
+    .await
+    .expect("rank");
     eprintln!("ranked returned {} articles", ranked.len());
     if ranked.is_empty() {
         eprintln!("no articles to test against");

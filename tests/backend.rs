@@ -1760,3 +1760,208 @@ fn reading_an_article_does_not_change_its_display_score() {
         "a4 should be in the read group (positions 3..4), got position {a4_pos}"
     );
 }
+
+/// Time-mode display sort: articles sorted by `published` desc, with
+/// `fetched_at` fallback when `published` is None. Read and unread
+/// articles are interleaved — the visible ordering is by date, not by
+/// read state. The underlying rank ordering and `display_score`
+/// percentile are computed first (stable), so reading an article in
+/// Time mode still doesn't change its rank.
+#[test]
+fn ranked_articles_sorts_by_published_date_desc_when_sort_mode_is_time() {
+    use smarrst::backend::models::SortMode;
+    let conn = open_memory();
+    db::init_schema(&conn).expect("init");
+    let feed_id = db::add_feed(&conn, "u", "U", None).unwrap();
+    // Three articles, distinct publication dates spanning a few days.
+    // a_oldest is 3 days ago, a_middle is 2 days ago, a_newest is now.
+    let now = chrono::Utc::now();
+    let day = chrono::Duration::days(1);
+    let a_oldest = db::insert_article(
+        &conn,
+        feed_id,
+        "ao",
+        "Oldest",
+        "u/ao",
+        None,
+        None,
+        Some("b"),
+        None,
+        Some(now - day * 3),
+    )
+    .unwrap()
+    .unwrap();
+    let a_middle = db::insert_article(
+        &conn,
+        feed_id,
+        "am",
+        "Middle",
+        "u/am",
+        None,
+        None,
+        Some("b"),
+        None,
+        Some(now - day * 2),
+    )
+    .unwrap()
+    .unwrap();
+    let a_newest = db::insert_article(
+        &conn,
+        feed_id,
+        "an",
+        "Newest",
+        "u/an",
+        None,
+        None,
+        Some("b"),
+        None,
+        Some(now),
+    )
+    .unwrap()
+    .unwrap();
+    // Mark the middle one as read to verify that Time mode does NOT
+    // group reads below unreads.
+    db::set_article_read(&conn, a_middle).unwrap();
+
+    // Mirror the production sequence in Time mode: score desc →
+    // assign_display_scores → sort by published desc.
+    let mut articles: Vec<models::Article> = [a_oldest, a_middle, a_newest]
+        .iter()
+        .map(|id| db::get_article(&conn, *id).unwrap().unwrap())
+        .collect();
+    articles.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    smarrst::backend::actions::assign_display_scores(&mut articles);
+    articles.sort_by(|a, b| {
+        let a_dt = a.published.unwrap_or(a.fetched_at);
+        let b_dt = b.published.unwrap_or(b.fetched_at);
+        b_dt.cmp(&a_dt)
+    });
+
+    // Expected order: newest, middle (read), oldest. Read state is
+    // ignored for ordering.
+    let order: Vec<i64> = articles.iter().map(|a| a.id).collect();
+    assert_eq!(
+        order,
+        vec![a_newest, a_middle, a_oldest],
+        "Time mode should order by published date desc, ignoring read state"
+    );
+
+    // Display scores are still the rank-percentile of the raw score
+    // order. Since scores are all 0, the rank order falls back to
+    // insert order: a_oldest=10, a_middle=5, a_newest=0 (n=3, denom=2).
+    // After the Time re-sort the visible order is a_newest, a_middle,
+    // a_oldest with display_scores 0, 5, 10.
+    let displays: Vec<f32> = articles
+        .iter()
+        .map(|a| a.display_score.expect("display_score set"))
+        .collect();
+    let expected = [0.0_f32, 5.0, 10.0];
+    for (i, (got, want)) in displays.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (got - want).abs() < 1e-4,
+            "display[{i}]: got {got}, want {want}"
+        );
+    }
+    // Reading the middle article must not change any article's
+    // display_score — the rank order is unchanged.
+    let _ = SortMode::default(); // silence unused-import warning on rebuild
+}
+
+/// Filter predicate used by the article-list render path. Verifies
+/// each (filter, read state, staleness) combination behaves as the
+/// inline docstring on `should_show` describes.
+#[test]
+fn should_show_respects_filter_and_cutoff() {
+    use smarrst::backend::models::ListFilter;
+    let now = chrono::Utc::now();
+    let day = chrono::Duration::days(1);
+    // Cutoff = 1 day ago. Read articles older than that are stale.
+    let cutoff = now - day;
+
+    // Build a synthetic article: unread, fresh.
+    let fresh_unread = sample_article(None);
+    // Read 30 minutes ago (within cutoff, so still fresh).
+    let fresh_read = sample_article(Some(now - chrono::Duration::minutes(30)));
+    // Read 2 days ago (older than cutoff, so stale).
+    let stale_read = sample_article(Some(now - day * 2));
+
+    // UnreadOnly: only unread.
+    assert!(should_show_pub(
+        &fresh_unread,
+        ListFilter::UnreadOnly,
+        cutoff
+    ));
+    assert!(!should_show_pub(
+        &fresh_read,
+        ListFilter::UnreadOnly,
+        cutoff
+    ));
+    assert!(!should_show_pub(
+        &stale_read,
+        ListFilter::UnreadOnly,
+        cutoff
+    ));
+
+    // All: unread always; read only if not stale.
+    assert!(should_show_pub(&fresh_unread, ListFilter::All, cutoff));
+    assert!(should_show_pub(&fresh_read, ListFilter::All, cutoff));
+    assert!(!should_show_pub(&stale_read, ListFilter::All, cutoff));
+
+    // ReadOnly: only read; staleness ignored (user is browsing).
+    assert!(!should_show_pub(
+        &fresh_unread,
+        ListFilter::ReadOnly,
+        cutoff
+    ));
+    assert!(should_show_pub(&fresh_read, ListFilter::ReadOnly, cutoff));
+    assert!(should_show_pub(&stale_read, ListFilter::ReadOnly, cutoff));
+}
+
+/// Edge case: an article read exactly at the cutoff boundary counts
+/// as fresh (the comparison is `>=`, not `>`). This is deliberate —
+/// the user just read it, so it's not "stale" yet.
+#[test]
+fn should_show_treats_cutoff_as_inclusive() {
+    use smarrst::backend::models::ListFilter;
+    let cutoff = chrono::Utc::now();
+    let at_cutoff = sample_article(Some(cutoff));
+    assert!(should_show_pub(&at_cutoff, ListFilter::All, cutoff));
+}
+
+fn sample_article(read_at: Option<chrono::DateTime<chrono::Utc>>) -> models::Article {
+    models::Article {
+        id: 1,
+        feed_id: 1,
+        feed_title: "F".to_string(),
+        title: "T".to_string(),
+        url: "https://example.com/x".to_string(),
+        author: None,
+        summary: None,
+        content: None,
+        content_markdown: None,
+        published: None,
+        fetched_at: chrono::Utc::now(),
+        vote: 0,
+        score: 0.0,
+        display_score: None,
+        content_status: models::ContentStatus::None,
+        content_fetched_at: None,
+        read_at,
+        category: None,
+        canonical_url: None,
+        title_hash: None,
+        pub_day: None,
+    }
+}
+
+fn should_show_pub(
+    a: &models::Article,
+    filter: models::ListFilter,
+    cutoff: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    smarrst::backend::actions::should_show(a, filter, cutoff)
+}

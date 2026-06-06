@@ -6,7 +6,7 @@
 //! One slow feed never blocks the others, and the manual button can't
 //! stack a second pipeline on top of an in-flight one.
 
-use crate::backend::models::{Article, Feed};
+use crate::backend::models::{Article, Feed, SortMode};
 use crate::backend::{actions, db, AppState};
 use chrono::{DateTime, Utc};
 use dioxus::prelude::WritableExt;
@@ -276,7 +276,7 @@ async fn refresh_ui_lists(
         let s = state.settings.lock().await;
         s.time_half_life_hours
     };
-    if let Ok(list) = actions::ranked_articles(state, None, half_life).await {
+    if let Ok(list) = actions::ranked_articles(state, None, half_life, SortMode::default()).await {
         *articles.write() = list;
     }
     if let Ok(counts) = actions::category_counts(state).await {

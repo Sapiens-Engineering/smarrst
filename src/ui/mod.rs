@@ -1,4 +1,4 @@
-use crate::backend::models::Article;
+use crate::backend::models::{Article, ListFilter, SortMode};
 use crate::backend::refresh::BackgroundStatus;
 use crate::ui::context::{use_app_state, AppContext};
 use dioxus::desktop::{use_window, LogicalSize};
@@ -29,6 +29,19 @@ pub fn App() -> Element {
     let mut refreshing = use_signal(|| false);
     let category_counts = use_signal(Vec::<(String, i64, i64)>::new);
     let background_status = use_signal(BackgroundStatus::default);
+    // Read-state filter applied client-side on top of the ranked list.
+    // Default UnreadOnly: once an article is read it's out of the user's
+    // way. Switch to "All" to see read articles too (with stale-read
+    // auto-hide) or "Read" to look at the read pile.
+    let mut list_filter = use_signal(ListFilter::default);
+    // Visual sort mode. Default Time: most users care about what's
+    // new. Switch to "Rating" for the AI preference ranking with
+    // read-state visual grouping.
+    let mut list_sort = use_signal(SortMode::default);
+    // Snapshot of `Settings::time_half_life_hours` used to compute the
+    // read-staleness cutoff for the "All" filter. Populated on mount
+    // and refreshed whenever the Settings dialog saves.
+    let mut time_half_life = use_signal(|| 168.0_f32);
     // Bumped after every successful list refresh; the article-list
     // section uses it as a `key` so the whole subtree re-mounts and
     // the for-loop is guaranteed to pick up new items. Without this,
@@ -39,6 +52,20 @@ pub fn App() -> Element {
     let list_version = use_signal(|| 0u64);
 
     let _app: AppContext = use_context();
+    // Populate the time_half_life snapshot from settings on mount.
+    // The render path reads this to compute the read-staleness cutoff
+    // for the "All" filter; the signal is also bumped from the
+    // Settings dialog's `on_saved` callback so a half-life change
+    // takes effect without restarting the app.
+    use_effect(move || {
+        let state = use_app_state();
+        let new_half_life = state
+            .settings
+            .try_lock()
+            .map(|s| s.time_half_life_hours)
+            .unwrap_or(168.0);
+        *time_half_life.write() = new_half_life;
+    });
     use_effect(move || {
         let state = use_app_state();
         spawn(async move {
@@ -47,6 +74,7 @@ pub fn App() -> Element {
                 state.clone(),
                 selected_feed(),
                 selected_category(),
+                list_sort(),
                 articles,
                 status_message,
                 list_version,
@@ -74,6 +102,7 @@ pub fn App() -> Element {
                 state.clone(),
                 selected_feed(),
                 cat.clone(),
+                list_sort(),
                 articles,
                 status_message,
                 list_version,
@@ -95,6 +124,7 @@ pub fn App() -> Element {
                 state,
                 selected_feed(),
                 cat,
+                list_sort(),
                 articles,
                 status_message,
                 list_version,
@@ -161,7 +191,7 @@ pub fn App() -> Element {
                                     Ok(n) => {
                                         *status_message.write() = format!("Refreshed {n} new articles");
                                         let cat = selected_category();
-                                        refresh_articles(state.clone(), selected_feed(), cat, articles, status_message, list_version).await;
+                                        refresh_articles(state.clone(), selected_feed(), cat, list_sort(), articles, status_message, list_version).await;
                                         refresh_category_counts(state.clone(), category_counts, status_message).await;
                                     }
                                     Err(e) => {
@@ -185,6 +215,68 @@ pub fn App() -> Element {
                     }
                 }
             }
+            div { class: "filter-bar",
+                div { class: "toggle-group",
+                    span { class: "toggle-label", "Show" }
+                    button {
+                        class: if list_filter() == ListFilter::UnreadOnly { "toggle-btn active" } else { "toggle-btn" },
+                        title: "Show only unread articles",
+                        onclick: move |_| *list_filter.write() = ListFilter::UnreadOnly,
+                        "Unread"
+                    }
+                    button {
+                        class: if list_filter() == ListFilter::All { "toggle-btn active" } else { "toggle-btn" },
+                        title: "Show all articles; hide reads older than the half-life cutoff",
+                        onclick: move |_| *list_filter.write() = ListFilter::All,
+                        "All"
+                    }
+                    button {
+                        class: if list_filter() == ListFilter::ReadOnly { "toggle-btn active" } else { "toggle-btn" },
+                        title: "Show only read articles",
+                        onclick: move |_| *list_filter.write() = ListFilter::ReadOnly,
+                        "Read"
+                    }
+                }
+                div { class: "toggle-group",
+                    span { class: "toggle-label", "Sort" }
+                    button {
+                        class: if list_sort() == SortMode::Time { "toggle-btn active" } else { "toggle-btn" },
+                        title: "Sort by publication date, newest first",
+                        onclick: move |_| {
+                            if list_sort() == SortMode::Time { return; }
+                            *list_sort.write() = SortMode::Time;
+                            let state = use_app_state();
+                            let cat = selected_category();
+                            let fid = selected_feed();
+                            let arts = articles;
+                            let stat = status_message;
+                            let lv = list_version;
+                            spawn(async move {
+                                refresh_articles(state, fid, cat, SortMode::Time, arts, stat, lv).await;
+                            });
+                        },
+                        "Time"
+                    }
+                    button {
+                        class: if list_sort() == SortMode::Rating { "toggle-btn active" } else { "toggle-btn" },
+                        title: "Sort by AI preference rank; group reads below unreads",
+                        onclick: move |_| {
+                            if list_sort() == SortMode::Rating { return; }
+                            *list_sort.write() = SortMode::Rating;
+                            let state = use_app_state();
+                            let cat = selected_category();
+                            let fid = selected_feed();
+                            let arts = articles;
+                            let stat = status_message;
+                            let lv = list_version;
+                            spawn(async move {
+                                refresh_articles(state, fid, cat, SortMode::Rating, arts, stat, lv).await;
+                            });
+                        },
+                        "Rating"
+                    }
+                }
+            }
             div { class: "status-bar", "{status_message()}" }
             div { class: "main",
                 aside { class: "sidebar",
@@ -197,7 +289,7 @@ pub fn App() -> Element {
                                 let state = use_app_state();
                                 let cat = selected_category();
                                 spawn(async move {
-                                    refresh_articles(state.clone(), None, cat, articles, status_message, list_version).await;
+                                    refresh_articles(state.clone(), None, cat, list_sort(), articles, status_message, list_version).await;
                                 });
                             },
                             "All articles"
@@ -211,7 +303,7 @@ pub fn App() -> Element {
                                     let state = use_app_state();
                                     let cat = selected_category();
                                     spawn(async move {
-                                        refresh_articles(state.clone(), Some(id), cat, articles, status_message, list_version).await;
+                                        refresh_articles(state.clone(), Some(id), cat, list_sort(), articles, status_message, list_version).await;
                                     });
                                 },
                                 on_delete: move |id: i64| {
@@ -225,7 +317,7 @@ pub fn App() -> Element {
                                         if selected_feed() == Some(id) {
                                             *selected_feed.write() = None;
                                         }
-                                        refresh_articles(state.clone(), selected_feed(), cat, articles, status_message, list_version).await;
+                                        refresh_articles(state.clone(), selected_feed(), cat, list_sort(), articles, status_message, list_version).await;
                                     });
                                 },
                             }
@@ -243,7 +335,7 @@ pub fn App() -> Element {
                                     let state = use_app_state();
                                     let fid = selected_feed();
                                     spawn(async move {
-                                        refresh_articles(state.clone(), fid, None, articles, status_message, list_version).await;
+                                        refresh_articles(state.clone(), fid, None, list_sort(), articles, status_message, list_version).await;
                                     });
                                 },
                                 "All"
@@ -260,7 +352,7 @@ pub fn App() -> Element {
                                         let state = use_app_state();
                                         let fid = selected_feed();
                                         spawn(async move {
-                                            refresh_articles(state.clone(), fid, Some(n), articles, status_message, list_version).await;
+                                            refresh_articles(state.clone(), fid, Some(n), list_sort(), articles, status_message, list_version).await;
                                         });
                                     },
                                 }
@@ -277,21 +369,55 @@ pub fn App() -> Element {
                                 Some(id) => feeds().iter().find(|f| f.id == id).map(|f| f.title.clone()).unwrap_or_else(|| "...".to_string()),
                                 None => "All articles".to_string(),
                             };
-                            match cat {
+                            let base = match cat {
                                 Some(c) => format!("{feed_label} · {c}"),
                                 None => feed_label,
-                            }
+                            };
+                            let filter_label = match list_filter() {
+                                ListFilter::UnreadOnly => "Unread",
+                                ListFilter::All => "All",
+                                ListFilter::ReadOnly => "Read",
+                            };
+                            format!("{base} · {filter_label}")
                         }
                     }
-                    if articles().is_empty() {
-                        div { class: "empty", "No articles yet. Add an RSS feed and hit Refresh." }
-                    } else {
-                        for a in articles() {
-                            ArticleListItem {
-                                key: "{a.id}",
-                                article: a.clone(),
-                                active: selected_article() == Some(a.id),
-                                on_select: move |id: i64| *selected_article.write() = Some(id),
+                    {
+                        // Client-side filter: applies `ListFilter` (with
+                        // the read-staleness cutoff in `All` mode) on
+                        // top of the backend-ranked list. Preserves the
+                        // order produced by `ranked_articles` (Time or
+                        // Rating sort).
+                        let now = chrono::Utc::now();
+                        let cutoff = now - chrono::Duration::hours(time_half_life() as i64);
+                        let filter = list_filter();
+                        let visible: Vec<Article> = articles()
+                            .into_iter()
+                            .filter(|a| backend::actions::should_show(a, filter, cutoff))
+                            .collect();
+                        let unread = visible.iter().filter(|a| a.read_at.is_none()).count();
+                        let read = visible.len() - unread;
+                        if visible.is_empty() {
+                            let msg = if articles().is_empty() {
+                                "No articles yet. Add an RSS feed and hit Refresh."
+                            } else {
+                                "No articles match the current filter."
+                            };
+                            rsx! { div { class: "empty", "{msg}" } }
+                        } else {
+                            let status_text = match list_filter() {
+                                ListFilter::All => format!("{unread} unread · {read} read shown"),
+                                _ => format!("{} shown", visible.len()),
+                            };
+                            rsx! {
+                                div { class: "article-list-status", "{status_text}" }
+                                for a in visible {
+                                    ArticleListItem {
+                                        key: "{a.id}",
+                                        article: a.clone(),
+                                        active: selected_article() == Some(a.id),
+                                        on_select: move |id: i64| *selected_article.write() = Some(id),
+                                    }
+                                }
                             }
                         }
                     }
@@ -305,7 +431,7 @@ pub fn App() -> Element {
                                 let state = use_app_state();
                                 let cat = selected_category();
                                 spawn(async move {
-                                    refresh_articles(state.clone(), selected_feed(), cat, articles, status_message, list_version).await;
+                                    refresh_articles(state.clone(), selected_feed(), cat, list_sort(), articles, status_message, list_version).await;
                                     refresh_category_counts(state.clone(), category_counts, status_message).await;
                                 });
                             },
@@ -325,7 +451,7 @@ pub fn App() -> Element {
                     let cat = selected_category();
                     spawn(async move {
                         refresh_feeds_list(state.clone(), feeds, status_message).await;
-                        refresh_articles(state.clone(), selected_feed(), cat, articles, status_message, list_version).await;
+                        refresh_articles(state.clone(), selected_feed(), cat, list_sort(), articles, status_message, list_version).await;
                     });
                 },
             }
@@ -333,6 +459,21 @@ pub fn App() -> Element {
         if show_settings() {
             SettingsDialog {
                 on_close: move |_| *show_settings.write() = false,
+                on_saved: move |_: ()| {
+                    // Refresh the local half-life snapshot so the
+                    // "All" filter's read-staleness cutoff picks up
+                    // the new value without restarting the app. The
+                    // rank-time half-life is read fresh from settings
+                    // on the next refresh, so this only matters for
+                    // the filter cutoff.
+                    let state = use_app_state();
+                    let new_half_life = state
+                        .settings
+                        .try_lock()
+                        .map(|s| s.time_half_life_hours)
+                        .unwrap_or(168.0);
+                    *time_half_life.write() = new_half_life;
+                },
             }
         }
     }
@@ -358,6 +499,7 @@ async fn refresh_articles(
     state: crate::backend::AppState,
     feed_filter: Option<i64>,
     category_filter: Option<String>,
+    sort_mode: SortMode,
     mut articles: Signal<Vec<Article>>,
     mut status: Signal<String>,
     mut list_version: Signal<u64>,
@@ -366,7 +508,7 @@ async fn refresh_articles(
         let s = state.settings.lock().await;
         s.time_half_life_hours
     };
-    match backend::actions::ranked_articles(&state, feed_filter, half_life).await {
+    match backend::actions::ranked_articles(&state, feed_filter, half_life, sort_mode).await {
         Ok(list) => {
             let filtered: Vec<Article> = if let Some(ref c) = category_filter {
                 list.into_iter()
@@ -506,7 +648,7 @@ fn ArticleListItem(article: Article, active: bool, on_select: EventHandler<i64>)
                 if let Some(d) = article.display_score {
                     span {
                         class: "article-list-score",
-                        title: "AI preference rank (0–10). 10 = highest-ranked, 0 = lowest-ranked. List position may differ from rank when read articles are grouped below unread ones.",
+                        title: "AI preference rank (0–10). Higher = more aligned with your votes. Stable across read state and sort mode.",
                         "{d:.1}"
                     }
                 }
@@ -850,7 +992,7 @@ fn AddFeedDialog(on_close: EventHandler<()>, on_added: EventHandler<()>) -> Elem
 }
 
 #[component]
-fn SettingsDialog(on_close: EventHandler<()>) -> Element {
+fn SettingsDialog(on_close: EventHandler<()>, on_saved: EventHandler<()>) -> Element {
     let state = use_app_state();
     let init_state = state.clone();
     let ping_state = state.clone();
@@ -958,6 +1100,7 @@ fn SettingsDialog(on_close: EventHandler<()>) -> Element {
                                 match backend::actions::save_settings(&state, &new_settings).await {
                                     Ok(()) => {
                                         *busy.write() = false;
+                                        on_saved.call(());
                                         on_close.call(());
                                     }
                                     Err(e) => {

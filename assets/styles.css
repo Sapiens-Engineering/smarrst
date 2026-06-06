@@ -96,6 +96,57 @@ input, button, select, textarea {
   flex-shrink: 0;
 }
 
+.filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 16px;
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.toggle-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.toggle-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+  margin-right: 4px;
+}
+
+.toggle-btn {
+  background: transparent;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s, border-color 0.1s;
+}
+.toggle-btn:hover { color: var(--text); border-color: var(--accent-2); }
+.toggle-btn.active {
+  background: var(--bg-elev-2);
+  color: var(--accent);
+  border-color: var(--accent-2);
+}
+
+.article-list-status {
+  padding: 6px 16px;
+  font-size: 11px;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  flex-shrink: 0;
+}
+
 .btn {
   background: var(--bg-elev-2);
   color: var(--text);
